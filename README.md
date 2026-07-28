@@ -47,6 +47,22 @@ provider profiles ─ llms ──┼─ Codex ──────── OpenAI Re
 
 ## 快速开始
 
+### 安装
+
+需要 Node.js 20+。
+
+```bash
+npm install -g @nvae/llmswitch
+# 或
+bun add -g @nvae/llmswitch
+```
+
+安装后可直接使用 `llms`（或 `llm-switch`）命令。本地开发可用：
+
+```bash
+bun run src/index.ts --help
+```
+
 ### 1. 添加供应商
 
 分别为需要使用的工具创建 profile：

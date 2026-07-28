@@ -47,6 +47,22 @@ provider profiles ─ llms ──┼─ Codex ──────── OpenAI Re
 
 ## Quick Start
 
+### Install
+
+Requires Node.js 20+.
+
+```bash
+npm install -g @nvae/llmswitch
+# or
+bun add -g @nvae/llmswitch
+```
+
+After installation, use the `llms` (or `llm-switch`) command. For local development:
+
+```bash
+bun run src/index.ts --help
+```
+
 ### 1. Add a provider
 
 Create profiles independently for the tools you use:

@@ -302,14 +302,16 @@ export async function runBridgeForeground(
 
 /**
  * Prefer the entry currently running this CLI so `bun run ./src/index.ts`
- * spawns the same source tree instead of a stale dist/ build.
+ * respawns the same source tree; published installs use dist/index.js.
  */
 function resolveCliEntry(): string {
   const running = process.argv[1];
   if (running && existsSync(running)) {
     return running;
   }
-  const dist = fileURLToPath(new URL("../../dist/index.js", import.meta.url));
-  if (existsSync(dist)) return dist;
-  return fileURLToPath(new URL("../index.ts", import.meta.url));
+  const compiled = fileURLToPath(new URL("../index.js", import.meta.url));
+  if (existsSync(compiled)) return compiled;
+  const source = fileURLToPath(new URL("../index.ts", import.meta.url));
+  if (existsSync(source)) return source;
+  throw new Error("无法定位 llmswitch 入口文件");
 }
