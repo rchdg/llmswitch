@@ -17,6 +17,7 @@ import {
   parseChatSseLine,
 } from "./anthropic-translate-response.js";
 import {
+  collectCustomToolNames,
   responsesToChatRequest,
   responsesToCompletionsRequest,
 } from "./translate-request.js";
@@ -275,6 +276,7 @@ async function forwardChatResponses(
   wantStream: boolean,
 ): Promise<void> {
   const chatReq = responsesToChatRequest(body);
+  const customTools = collectCustomToolNames(body.tools);
   const url = joinUrl(upstream.baseUrl, "/chat/completions");
 
   let response: Response;
@@ -311,11 +313,20 @@ async function forwardChatResponses(
 
   if (!wantStream) {
     const json = (await response.json()) as Record<string, unknown>;
-    sendJson(res, 200, chatCompletionToResponse(json, String(body.model || "")));
+    sendJson(
+      res,
+      200,
+      chatCompletionToResponse(json, String(body.model || ""), customTools),
+    );
     return;
   }
 
-  await pipeChatStreamToResponses(response, res, String(body.model || ""));
+  await pipeChatStreamToResponses(
+    response,
+    res,
+    String(body.model || ""),
+    customTools,
+  );
 }
 
 async function forwardCompletions(
@@ -326,6 +337,7 @@ async function forwardCompletions(
   wantStream: boolean,
 ): Promise<void> {
   const completionReq = responsesToCompletionsRequest(body);
+  const customTools = collectCustomToolNames(body.tools);
   const url = joinUrl(upstream.baseUrl, "/completions");
 
   let response: Response;
@@ -358,17 +370,27 @@ async function forwardCompletions(
 
   if (!wantStream) {
     const json = (await response.json()) as Record<string, unknown>;
-    sendJson(res, 200, chatCompletionToResponse(json, String(body.model || "")));
+    sendJson(
+      res,
+      200,
+      chatCompletionToResponse(json, String(body.model || ""), customTools),
+    );
     return;
   }
 
-  await pipeChatStreamToResponses(response, res, String(body.model || ""));
+  await pipeChatStreamToResponses(
+    response,
+    res,
+    String(body.model || ""),
+    customTools,
+  );
 }
 
 async function pipeChatStreamToResponses(
   upstream: Response,
   res: ServerResponse,
   model: string,
+  customTools?: Iterable<string>,
 ): Promise<void> {
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -377,7 +399,7 @@ async function pipeChatStreamToResponses(
     "X-Accel-Buffering": "no",
   });
 
-  const state = createStreamState(model);
+  const state = createStreamState(model, undefined, customTools);
   const reader = upstream.body?.getReader();
   if (!reader) {
     for (const frame of forceCompleteStream(state)) res.write(frame);

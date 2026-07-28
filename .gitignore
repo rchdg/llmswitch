@@ -6,3 +6,9 @@ dist/
 .env.*
 coverage/
 *.log
+*.tsbuildinfo
+
+# Local agent / IDE tooling
+.agents/
+.claude/
+skills-lock.json

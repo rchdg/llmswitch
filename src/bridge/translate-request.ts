@@ -139,12 +139,23 @@ export function responsesInputToMessages(
     if (type === "function_call" || type === "custom_tool_call") {
       const callId = String(item.call_id || item.id || `call_${messages.length}`);
       const name = String(item.name || "tool");
-      const args =
-        typeof item.arguments === "string"
-          ? item.arguments
-          : typeof item.input === "string"
+      let args: string;
+      if (type === "custom_tool_call") {
+        const input =
+          typeof item.input === "string"
             ? item.input
-            : JSON.stringify(item.arguments ?? item.input ?? {});
+            : typeof item.arguments === "string"
+              ? item.arguments
+              : JSON.stringify(item.input ?? item.arguments ?? {});
+        // Chat upstreams expect function.arguments to be a JSON object string.
+        args = JSON.stringify({ input });
+      } else if (typeof item.arguments === "string") {
+        args = item.arguments;
+      } else if (typeof item.input === "string") {
+        args = item.input;
+      } else {
+        args = JSON.stringify(item.arguments ?? item.input ?? {});
+      }
       pendingToolCalls.push({
         id: callId,
         type: "function",
@@ -186,6 +197,24 @@ export function responsesInputToMessages(
   return messages;
 }
 
+/**
+ * Names of Responses `type: "custom"` (freeform) tools.
+ * Chat upstreams only speak function tools; the response translator must
+ * convert matching tool_calls back to `custom_tool_call` for Codex.
+ */
+export function collectCustomToolNames(tools: unknown): Set<string> {
+  const names = new Set<string>();
+  if (!Array.isArray(tools)) return names;
+  for (const raw of tools) {
+    const tool = asRecord(raw);
+    if (!tool) continue;
+    if (String(tool.type || "") !== "custom") continue;
+    const name = String(tool.name || "").trim();
+    if (name) names.add(name);
+  }
+  return names;
+}
+
 export function mapResponsesTools(
   tools: unknown,
 ): ChatRequest["tools"] | undefined {
@@ -225,7 +254,7 @@ export function mapResponsesTools(
       continue;
     }
 
-    // Map Codex local_shell / custom to a generic function for chat upstreams
+    // Map Codex local_shell / custom / hosted tools to chat function tools
     if (type === "local_shell") {
       out.push({
         type: "function",
@@ -244,15 +273,67 @@ export function mapResponsesTools(
     }
 
     if (type === "custom") {
+      const description =
+        typeof tool.description === "string"
+          ? tool.description
+          : "Custom freeform tool. Put the entire freeform payload in the input field; do not wrap it in extra JSON beyond the function arguments object.";
       out.push({
         type: "function",
         function: {
           name: String(tool.name || "custom"),
-          description:
-            typeof tool.description === "string" ? tool.description : "Custom tool",
+          description,
           parameters: tool.parameters || {
             type: "object",
-            properties: { input: { type: "string" } },
+            properties: {
+              input: {
+                type: "string",
+                description: "Freeform tool input (raw text, not nested JSON)",
+              },
+            },
+            required: ["input"],
+          },
+        },
+      });
+      continue;
+    }
+
+    // OpenAI hosted web_search is not available on chat upstreams; expose as a
+    // client-executed function so Codex can still run its local handler.
+    if (type === "web_search" || type === "web_search_preview") {
+      out.push({
+        type: "function",
+        function: {
+          name: "web_search",
+          description:
+            typeof tool.description === "string"
+              ? tool.description
+              : "Search the web for current information",
+          parameters: {
+            type: "object",
+            properties: {
+              query: { type: "string", description: "Search query" },
+            },
+            required: ["query"],
+          },
+        },
+      });
+      continue;
+    }
+
+    if (type === "tool_search") {
+      out.push({
+        type: "function",
+        function: {
+          name: "tool_search",
+          description:
+            typeof tool.description === "string"
+              ? tool.description
+              : "Search for available tools",
+          parameters: tool.parameters || {
+            type: "object",
+            properties: {
+              query: { type: "string" },
+            },
           },
         },
       });

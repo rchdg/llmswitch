@@ -48,6 +48,8 @@ export interface StreamBridgeState {
   textContentIndex: number;
   outputIndex: number;
   fullText: string;
+  /** Responses `type: "custom"` tool names that must round-trip as custom_tool_call. */
+  customTools: Set<string>;
   toolCalls: Map<
     number,
     {
@@ -56,6 +58,9 @@ export interface StreamBridgeState {
       name: string;
       arguments: string;
       started: boolean;
+      custom: boolean;
+      /** output_index assigned when the item was added (stable for deltas/done). */
+      outputIndex: number;
     }
   >;
   created: boolean;
@@ -63,7 +68,11 @@ export interface StreamBridgeState {
   usage?: ReturnType<typeof mapUsage>;
 }
 
-export function createStreamState(model: string, responseId?: string): StreamBridgeState {
+export function createStreamState(
+  model: string,
+  responseId?: string,
+  customTools?: Iterable<string>,
+): StreamBridgeState {
   return {
     responseId: responseId || newId("resp"),
     model,
@@ -72,10 +81,39 @@ export function createStreamState(model: string, responseId?: string): StreamBri
     textContentIndex: 0,
     outputIndex: 0,
     fullText: "",
+    customTools: new Set(customTools ?? []),
     toolCalls: new Map(),
     created: false,
     completed: false,
   };
+}
+
+/**
+ * Chat function-calling often wraps freeform payloads as `{"input":"..."}`.
+ * Codex custom tools need the raw string in `input`.
+ */
+export function unwrapCustomToolInput(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (typeof parsed === "string") return parsed;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const obj = parsed as Record<string, unknown>;
+      if (typeof obj.input === "string") return obj.input;
+      if (typeof obj.text === "string") return obj.text;
+      if (typeof obj.query === "string" && Object.keys(obj).length === 1) {
+        return obj.query;
+      }
+    }
+  } catch {
+    // Freeform text / partial JSON — keep as-is
+  }
+  return raw;
+}
+
+function isCustomToolName(state: StreamBridgeState, name: string): boolean {
+  return Boolean(name) && state.customTools.has(name);
 }
 
 function baseResponse(state: StreamBridgeState, status: string) {
@@ -183,68 +221,115 @@ export function chatChunkToResponsesEvents(
 
       if (!entry) {
         const callId = String(tc.id || newId("call"));
+        const name = String(fn.name || "");
         entry = {
-          itemId: newId("fc"),
+          itemId: newId(isCustomToolName(state, name) ? "ctc" : "fc"),
           callId,
-          name: String(fn.name || ""),
+          name,
           arguments: "",
           started: false,
+          custom: isCustomToolName(state, name),
+          outputIndex: -1,
         };
         state.toolCalls.set(idx, entry);
       } else {
         if (tc.id) entry.callId = String(tc.id);
-        if (typeof fn.name === "string" && fn.name) entry.name = fn.name;
+        if (typeof fn.name === "string" && fn.name) {
+          entry.name = fn.name;
+          entry.custom = isCustomToolName(state, entry.name);
+        }
       }
 
       if (!entry.started && entry.name) {
         entry.started = true;
+        entry.custom = isCustomToolName(state, entry.name);
         // Close text item before tool calls if needed
         if (state.textStarted && state.textItemId) {
           closeTextItem(state, out);
         }
-        const outputIndex = state.outputIndex;
-        out.push(
-          sseEvent("response.output_item.added", {
-            output_index: outputIndex,
-            item: {
-              id: entry.itemId,
-              type: "function_call",
-              status: "in_progress",
-              call_id: entry.callId,
-              name: entry.name,
-              arguments: "",
-            },
-          }),
-        );
+        entry.outputIndex = state.outputIndex;
+        state.outputIndex += 1;
+        if (entry.custom) {
+          out.push(
+            sseEvent("response.output_item.added", {
+              output_index: entry.outputIndex,
+              item: {
+                id: entry.itemId,
+                type: "custom_tool_call",
+                status: "in_progress",
+                call_id: entry.callId,
+                name: entry.name,
+                input: "",
+              },
+            }),
+          );
+        } else {
+          out.push(
+            sseEvent("response.output_item.added", {
+              output_index: entry.outputIndex,
+              item: {
+                id: entry.itemId,
+                type: "function_call",
+                status: "in_progress",
+                call_id: entry.callId,
+                name: entry.name,
+                arguments: "",
+              },
+            }),
+          );
+        }
       }
 
       if (typeof fn.arguments === "string" && fn.arguments.length > 0) {
         if (!entry.started) {
           // name may arrive later; start with placeholder
           entry.started = true;
+          entry.custom = isCustomToolName(state, entry.name);
           if (state.textStarted && state.textItemId) closeTextItem(state, out);
+          entry.outputIndex = state.outputIndex;
+          state.outputIndex += 1;
+          if (entry.custom) {
+            out.push(
+              sseEvent("response.output_item.added", {
+                output_index: entry.outputIndex,
+                item: {
+                  id: entry.itemId,
+                  type: "custom_tool_call",
+                  status: "in_progress",
+                  call_id: entry.callId,
+                  name: entry.name || "tool",
+                  input: "",
+                },
+              }),
+            );
+          } else {
+            out.push(
+              sseEvent("response.output_item.added", {
+                output_index: entry.outputIndex,
+                item: {
+                  id: entry.itemId,
+                  type: "function_call",
+                  status: "in_progress",
+                  call_id: entry.callId,
+                  name: entry.name || "tool",
+                  arguments: "",
+                },
+              }),
+            );
+          }
+        }
+        entry.arguments += fn.arguments;
+        // For custom tools, buffer JSON-wrapped args and emit raw input at done.
+        // Function tools stream argument deltas as usual.
+        if (!entry.custom) {
           out.push(
-            sseEvent("response.output_item.added", {
-              output_index: state.outputIndex,
-              item: {
-                id: entry.itemId,
-                type: "function_call",
-                status: "in_progress",
-                call_id: entry.callId,
-                name: entry.name || "tool",
-                arguments: "",
-              },
+            sseEvent("response.function_call_arguments.delta", {
+              item_id: entry.itemId,
+              output_index: entry.outputIndex,
+              delta: fn.arguments,
             }),
           );
         }
-        entry.arguments += fn.arguments;
-        out.push(
-          sseEvent("response.function_call_arguments.delta", {
-            item_id: entry.itemId,
-            output_index: state.outputIndex,
-            delta: fn.arguments,
-          }),
-        );
       }
     }
 
@@ -307,27 +392,68 @@ function finalizeStream(
 
   for (const entry of state.toolCalls.values()) {
     if (!entry.started) continue;
-    out.push(
-      sseEvent("response.function_call_arguments.done", {
-        item_id: entry.itemId,
-        output_index: state.outputIndex,
-        arguments: entry.arguments,
-      }),
-    );
-    out.push(
-      sseEvent("response.output_item.done", {
-        output_index: state.outputIndex,
-        item: {
-          id: entry.itemId,
-          type: "function_call",
-          status: "completed",
+    // Re-evaluate in case the name arrived after the item was opened
+    entry.custom = isCustomToolName(state, entry.name) || entry.custom;
+    const outputIndex =
+      entry.outputIndex >= 0 ? entry.outputIndex : state.outputIndex;
+
+    if (entry.custom) {
+      const input = unwrapCustomToolInput(entry.arguments);
+      out.push(
+        sseEvent("response.custom_tool_call_input.delta", {
+          item_id: entry.itemId,
+          output_index: outputIndex,
           call_id: entry.callId,
-          name: entry.name || "tool",
+          delta: input,
+        }),
+      );
+      out.push(
+        sseEvent("response.custom_tool_call_input.done", {
+          item_id: entry.itemId,
+          output_index: outputIndex,
+          call_id: entry.callId,
+          input,
+        }),
+      );
+      out.push(
+        sseEvent("response.output_item.done", {
+          output_index: outputIndex,
+          item: {
+            id: entry.itemId,
+            type: "custom_tool_call",
+            status: "completed",
+            call_id: entry.callId,
+            name: entry.name || "tool",
+            input,
+          },
+        }),
+      );
+    } else {
+      out.push(
+        sseEvent("response.function_call_arguments.done", {
+          item_id: entry.itemId,
+          output_index: outputIndex,
           arguments: entry.arguments,
-        },
-      }),
-    );
-    state.outputIndex += 1;
+        }),
+      );
+      out.push(
+        sseEvent("response.output_item.done", {
+          output_index: outputIndex,
+          item: {
+            id: entry.itemId,
+            type: "function_call",
+            status: "completed",
+            call_id: entry.callId,
+            name: entry.name || "tool",
+            arguments: entry.arguments,
+          },
+        }),
+      );
+    }
+    if (entry.outputIndex < 0) {
+      entry.outputIndex = outputIndex;
+      state.outputIndex = Math.max(state.outputIndex, outputIndex + 1);
+    }
   }
 
   const status =
@@ -346,14 +472,25 @@ function finalizeStream(
     });
   }
   for (const entry of state.toolCalls.values()) {
-    output.push({
-      id: entry.itemId,
-      type: "function_call",
-      status: "completed",
-      call_id: entry.callId,
-      name: entry.name || "tool",
-      arguments: entry.arguments,
-    });
+    if (entry.custom) {
+      output.push({
+        id: entry.itemId,
+        type: "custom_tool_call",
+        status: "completed",
+        call_id: entry.callId,
+        name: entry.name || "tool",
+        input: unwrapCustomToolInput(entry.arguments),
+      });
+    } else {
+      output.push({
+        id: entry.itemId,
+        type: "function_call",
+        status: "completed",
+        call_id: entry.callId,
+        name: entry.name || "tool",
+        arguments: entry.arguments,
+      });
+    }
   }
 
   const response = {
@@ -379,9 +516,11 @@ export function forceCompleteStream(state: StreamBridgeState): string[] {
 export function chatCompletionToResponse(
   chat: Record<string, unknown>,
   modelFallback?: string,
+  customTools?: Iterable<string>,
 ): Record<string, unknown> {
   const id = newId("resp");
   const model = String(chat.model || modelFallback || "");
+  const customSet = new Set(customTools ?? []);
   const usage = mapUsage(
     chat.usage && typeof chat.usage === "object"
       ? (chat.usage as Record<string, unknown>)
@@ -415,17 +554,30 @@ export function chatCompletionToResponse(
   for (const tcRaw of toolCalls) {
     const tc = tcRaw as Record<string, unknown>;
     const fn = (tc.function || {}) as Record<string, unknown>;
-    output.push({
-      id: newId("fc"),
-      type: "function_call",
-      status: "completed",
-      call_id: String(tc.id || newId("call")),
-      name: String(fn.name || "tool"),
-      arguments:
-        typeof fn.arguments === "string"
-          ? fn.arguments
-          : JSON.stringify(fn.arguments ?? {}),
-    });
+    const name = String(fn.name || "tool");
+    const args =
+      typeof fn.arguments === "string"
+        ? fn.arguments
+        : JSON.stringify(fn.arguments ?? {});
+    if (customSet.has(name)) {
+      output.push({
+        id: newId("ctc"),
+        type: "custom_tool_call",
+        status: "completed",
+        call_id: String(tc.id || newId("call")),
+        name,
+        input: unwrapCustomToolInput(args),
+      });
+    } else {
+      output.push({
+        id: newId("fc"),
+        type: "function_call",
+        status: "completed",
+        call_id: String(tc.id || newId("call")),
+        name,
+        arguments: args,
+      });
+    }
   }
 
   const finish = String(choice.finish_reason || "stop");
