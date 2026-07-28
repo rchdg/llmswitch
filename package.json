@@ -1,0 +1,44 @@
+{
+  "name": "llm-switch",
+  "version": "0.2.0",
+  "description": "CLI to switch LLM providers and models for Claude Code, Codex, and OpenCode",
+  "type": "module",
+  "bin": {
+    "llms": "./dist/index.js",
+    "llm-switch": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist --target node --format esm && bun run scripts/add-shebang.ts",
+    "dev": "bun run ./src/index.ts",
+    "test": "bun test",
+    "prepublishOnly": "bun run build"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "cli",
+    "llm",
+    "claude-code",
+    "codex",
+    "opencode",
+    "provider",
+    "model-switch"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@clack/prompts": "^0.11.0",
+    "commander": "^14.0.0",
+    "smol-toml": "^1.4.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.19",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.3"
+  }
+}
