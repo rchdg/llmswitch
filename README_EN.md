@@ -284,7 +284,7 @@ Protect the configuration directories, never commit their contents to version co
 - Anthropic translation primarily covers text, tool calls, and tool results. Images and other non-text content may not be preserved completely.
 - Codex Completions mode is a degraded fallback: the conversation is flattened into a prompt, so complex tool calls and agent workflows may not behave well.
 - Codex Chat mode falls back to Completions only when the upstream returns HTTP `404` or `405`. Authentication, network, and other errors do not trigger fallback.
-- Hosted `web_search` tools are translated into ordinary client-side functions and do not automatically gain hosted search capabilities from the upstream service.
+- Hosted `web_search` requests are translated into ordinary Chat functions. If the upstream performs the search itself and returns a complete `<web_search>...</web_search>` block, the bridge restores it as a Responses `web_search_call` and preserves the result text without the tags.
 - Automatic model discovery requires an API key and a compatible `/models` endpoint. Enter model IDs manually when discovery fails.
 
 ## Contributing

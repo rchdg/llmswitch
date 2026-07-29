@@ -13,6 +13,15 @@ import {
   unwrapCustomToolInput,
 } from "../src/bridge/translate-response.ts";
 
+function parseResponseFrames(frames: string[]): Array<Record<string, unknown>> {
+  return frames
+    .join("")
+    .split(/\n\n/)
+    .map((frame) => frame.split("\n").find((line) => line.startsWith("data: ")))
+    .filter((line): line is string => Boolean(line))
+    .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>);
+}
+
 describe("responsesToChatRequest", () => {
   test("maps instructions, messages, tools and function outputs", () => {
     const chat = responsesToChatRequest({
@@ -302,5 +311,185 @@ describe("chat stream → responses events", () => {
     );
     const end = forceCompleteStream(state).join("");
     expect(end).toContain("response.completed");
+  });
+
+  test("converts split web search markup and preserves output order", () => {
+    const state = createStreamState("m", "resp_test", undefined, true);
+    const frames = [
+      ...chatChunkToResponsesEvents(
+        { choices: [{ delta: { content: "Before <web_" }, index: 0 }] },
+        state,
+      ),
+      ...chatChunkToResponsesEvents(
+        {
+          choices: [
+            {
+              delta: {
+                content: 'search>\nSearch results for “Tokyo weather”:\n1. Sunny</web_',
+              },
+              index: 0,
+            },
+          ],
+        },
+        state,
+      ),
+      ...chatChunkToResponsesEvents(
+        {
+          choices: [
+            {
+              delta: { content: "search> After" },
+              finish_reason: "stop",
+              index: 0,
+            },
+          ],
+        },
+        state,
+      ),
+    ];
+    const events = parseResponseFrames(frames);
+    const done = events.filter(
+      (event) => event.type === "response.output_item.done",
+    );
+    const doneItems = done.map(
+      (event) => event.item as Record<string, unknown>,
+    );
+
+    expect(doneItems.map((item) => item.type)).toEqual([
+      "message",
+      "web_search_call",
+      "message",
+      "message",
+    ]);
+    expect(doneItems[0]?.content).toEqual([
+      { type: "output_text", text: "Before ", annotations: [] },
+    ]);
+    expect(doneItems[1]?.action).toEqual({
+      type: "search",
+      query: "Tokyo weather",
+    });
+    expect(doneItems[2]?.content).toEqual([
+      {
+        type: "output_text",
+        text: "\nSearch results for “Tokyo weather”:\n1. Sunny",
+        annotations: [],
+      },
+    ]);
+    expect(doneItems[3]?.content).toEqual([
+      { type: "output_text", text: " After", annotations: [] },
+    ]);
+
+    const completed = events.find(
+      (event) => event.type === "response.completed",
+    );
+    const response = completed?.response as Record<string, unknown>;
+    const output = response.output as Array<Record<string, unknown>>;
+    expect(output).toEqual(doneItems);
+    expect(frames.join("")).not.toContain("<web_search>");
+    expect(frames.join("")).not.toContain("</web_search>");
+  });
+
+  test("converts multiple web searches and omits empty result messages", () => {
+    const state = createStreamState("m", undefined, undefined, true);
+    const frames = chatChunkToResponsesEvents(
+      {
+        choices: [
+          {
+            delta: {
+              content:
+                '<web_search>Search results for "one":\nA</web_search><web_search></web_search>',
+            },
+            finish_reason: "stop",
+            index: 0,
+          },
+        ],
+      },
+      state,
+    );
+    const doneItems = parseResponseFrames(frames)
+      .filter((event) => event.type === "response.output_item.done")
+      .map((event) => event.item as Record<string, unknown>);
+
+    expect(doneItems.map((item) => item.type)).toEqual([
+      "web_search_call",
+      "message",
+      "web_search_call",
+    ]);
+    expect(new Set(doneItems.map((item) => item.id)).size).toBe(3);
+    expect(doneItems[2]?.action).toEqual({ type: "search" });
+  });
+
+  test("falls back to text for incomplete or explicitly disabled web search markup", () => {
+    const incompleteState = createStreamState("m", undefined, undefined, true);
+    const incompleteFrames = chatChunkToResponsesEvents(
+      {
+        choices: [
+          {
+            delta: { content: "prefix <web_search>unfinished" },
+            index: 0,
+          },
+        ],
+      },
+      incompleteState,
+    );
+    incompleteFrames.push(...forceCompleteStream(incompleteState));
+    const incompleteText = parseResponseFrames(incompleteFrames)
+      .filter((event) => event.type === "response.output_item.done")
+      .flatMap((event) => {
+        const item = event.item as Record<string, unknown>;
+        return item.type === "message"
+          ? (item.content as Array<{ text: string }>).map((part) => part.text)
+          : [];
+      })
+      .join("");
+    expect(incompleteText).toBe("prefix <web_search>unfinished");
+
+    const disabledState = createStreamState("m");
+    const disabledFrames = chatChunkToResponsesEvents(
+      {
+        choices: [
+          {
+            delta: { content: "<web_search>raw</web_search>" },
+            finish_reason: "stop",
+            index: 0,
+          },
+        ],
+      },
+      disabledState,
+    );
+    expect(disabledFrames.join("")).toContain(
+      "<web_search>raw</web_search>",
+    );
+    expect(disabledFrames.join("")).not.toContain("web_search_call");
+  });
+
+  test("non-stream conversion emits web search and cleaned result message", () => {
+    const resp = chatCompletionToResponse(
+      {
+        model: "m",
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content:
+                'Intro<web_search>Search results for "Bun":\nresult</web_search>Outro',
+            },
+            finish_reason: "stop",
+          },
+        ],
+      },
+      "m",
+      undefined,
+      true,
+    );
+    const output = resp.output as Array<Record<string, unknown>>;
+
+    expect(output.map((item) => item.type)).toEqual([
+      "message",
+      "web_search_call",
+      "message",
+      "message",
+    ]);
+    expect(output[1]?.action).toEqual({ type: "search", query: "Bun" });
+    expect(JSON.stringify(output)).not.toContain("<web_search>");
   });
 });

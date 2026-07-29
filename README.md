@@ -284,7 +284,7 @@ API Key 会以**明文**保存在本机 profile、目标工具认证文件或 br
 - Anthropic 转换主要覆盖文本、工具调用和工具结果，图片等非文本内容可能无法完整保留。
 - Codex 的 Completions 模式是降级路径：对话会被展平为 prompt，复杂工具调用或 agent 流程可能表现不佳。
 - Codex Chat 模式仅在上游返回 HTTP `404` 或 `405` 时回退到 Completions；认证、网络及其他错误不会触发回退。
-- 托管 `web_search` 会转换为普通客户端函数，不会自动获得上游的托管搜索能力。
+- 请求中的托管 `web_search` 会转换为普通 Chat function；若上游自行搜索并以完整 `<web_search>...</web_search>` 块返回结果，bridge 会将其恢复为 Responses `web_search_call`，并保留去标签后的结果正文。
 - 自动发现模型需要 API Key 和兼容的 `/models` 端点；失败时需手动输入模型。
 
 ## 参与贡献

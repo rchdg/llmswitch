@@ -47,7 +47,14 @@ export interface StreamBridgeState {
   textStarted: boolean;
   textContentIndex: number;
   outputIndex: number;
-  fullText: string;
+  currentText: string;
+  completedItems: Array<{
+    outputIndex: number;
+    item: Record<string, unknown>;
+  }>;
+  webSearchEnabled: boolean;
+  webSearchBuffer: string;
+  insideWebSearch: boolean;
   /** Responses `type: "custom"` tool names that must round-trip as custom_tool_call. */
   customTools: Set<string>;
   toolCalls: Map<
@@ -72,6 +79,7 @@ export function createStreamState(
   model: string,
   responseId?: string,
   customTools?: Iterable<string>,
+  webSearchEnabled = false,
 ): StreamBridgeState {
   return {
     responseId: responseId || newId("resp"),
@@ -80,12 +88,73 @@ export function createStreamState(
     textStarted: false,
     textContentIndex: 0,
     outputIndex: 0,
-    fullText: "",
+    currentText: "",
+    completedItems: [],
+    webSearchEnabled,
+    webSearchBuffer: "",
+    insideWebSearch: false,
     customTools: new Set(customTools ?? []),
     toolCalls: new Map(),
     created: false,
     completed: false,
   };
+}
+
+const WEB_SEARCH_OPEN = "<web_search>";
+const WEB_SEARCH_CLOSE = "</web_search>";
+
+type TextSegment =
+  | { type: "text"; content: string }
+  | { type: "web_search"; content: string };
+
+function pushTextSegment(segments: TextSegment[], content: string): void {
+  if (!content) return;
+  const previous = segments[segments.length - 1];
+  if (previous?.type === "text") previous.content += content;
+  else segments.push({ type: "text", content });
+}
+
+function splitWebSearchContent(
+  content: string,
+  enabled: boolean,
+): TextSegment[] {
+  if (!enabled || !content) {
+    return content ? [{ type: "text", content }] : [];
+  }
+
+  const segments: TextSegment[] = [];
+  let cursor = 0;
+  while (cursor < content.length) {
+    const open = content.indexOf(WEB_SEARCH_OPEN, cursor);
+    if (open < 0) {
+      pushTextSegment(segments, content.slice(cursor));
+      break;
+    }
+    const close = content.indexOf(
+      WEB_SEARCH_CLOSE,
+      open + WEB_SEARCH_OPEN.length,
+    );
+    if (close < 0) {
+      pushTextSegment(segments, content.slice(cursor));
+      break;
+    }
+    pushTextSegment(segments, content.slice(cursor, open));
+    segments.push({
+      type: "web_search",
+      content: content.slice(open + WEB_SEARCH_OPEN.length, close),
+    });
+    cursor = close + WEB_SEARCH_CLOSE.length;
+  }
+  return segments;
+}
+
+function webSearchAction(content: string): Record<string, unknown> {
+  const match = content.match(
+    /^\s*Search results for\s+["“]([^"”]+)["”]\s*:/,
+  );
+  return match
+    ? { type: "search", query: match[1] }
+    : { type: "search" };
 }
 
 /**
@@ -142,6 +211,7 @@ function ensureTextItem(state: StreamBridgeState, out: string[]): void {
   if (state.textStarted) return;
   state.textStarted = true;
   state.textItemId = newId("msg");
+  state.currentText = "";
   const outputIndex = state.outputIndex;
   out.push(
     sseEvent("response.output_item.added", {
@@ -165,6 +235,130 @@ function ensureTextItem(state: StreamBridgeState, out: string[]): void {
   );
 }
 
+function emitTextDelta(
+  state: StreamBridgeState,
+  out: string[],
+  content: string,
+): void {
+  if (!content) return;
+  ensureTextItem(state, out);
+  state.currentText += content;
+  out.push(
+    sseEvent("response.output_text.delta", {
+      item_id: state.textItemId,
+      output_index: state.outputIndex,
+      content_index: state.textContentIndex,
+      delta: content,
+    }),
+  );
+}
+
+function pendingOpenTagLength(value: string): number {
+  const max = Math.min(value.length, WEB_SEARCH_OPEN.length - 1);
+  for (let length = max; length > 0; length -= 1) {
+    if (WEB_SEARCH_OPEN.startsWith(value.slice(-length))) return length;
+  }
+  return 0;
+}
+
+function emitWebSearchItem(
+  state: StreamBridgeState,
+  out: string[],
+  content: string,
+): void {
+  if (state.textStarted) closeTextItem(state, out);
+  const outputIndex = state.outputIndex;
+  const itemId = newId("ws");
+  const action = webSearchAction(content);
+  out.push(
+    sseEvent("response.output_item.added", {
+      output_index: outputIndex,
+      item: {
+        id: itemId,
+        type: "web_search_call",
+        status: "in_progress",
+        action,
+      },
+    }),
+  );
+  const item = {
+    id: itemId,
+    type: "web_search_call",
+    status: "completed",
+    action,
+  };
+  out.push(
+    sseEvent("response.output_item.done", {
+      output_index: outputIndex,
+      item,
+    }),
+  );
+  state.completedItems.push({ outputIndex, item });
+  state.outputIndex += 1;
+
+  if (content) {
+    emitTextDelta(state, out, content);
+    closeTextItem(state, out);
+  }
+}
+
+function consumeTextContent(
+  state: StreamBridgeState,
+  out: string[],
+  content: string,
+): void {
+  if (!content) return;
+  if (!state.webSearchEnabled) {
+    emitTextDelta(state, out, content);
+    return;
+  }
+
+  state.webSearchBuffer += content;
+  while (state.webSearchBuffer) {
+    if (state.insideWebSearch) {
+      const close = state.webSearchBuffer.indexOf(WEB_SEARCH_CLOSE);
+      if (close < 0) return;
+      const searchContent = state.webSearchBuffer.slice(0, close);
+      state.webSearchBuffer = state.webSearchBuffer.slice(
+        close + WEB_SEARCH_CLOSE.length,
+      );
+      state.insideWebSearch = false;
+      emitWebSearchItem(state, out, searchContent);
+      continue;
+    }
+
+    const open = state.webSearchBuffer.indexOf(WEB_SEARCH_OPEN);
+    if (open >= 0) {
+      emitTextDelta(state, out, state.webSearchBuffer.slice(0, open));
+      if (state.textStarted) closeTextItem(state, out);
+      state.webSearchBuffer = state.webSearchBuffer.slice(
+        open + WEB_SEARCH_OPEN.length,
+      );
+      state.insideWebSearch = true;
+      continue;
+    }
+
+    const pending = pendingOpenTagLength(state.webSearchBuffer);
+    const safeLength = state.webSearchBuffer.length - pending;
+    emitTextDelta(state, out, state.webSearchBuffer.slice(0, safeLength));
+    state.webSearchBuffer = state.webSearchBuffer.slice(safeLength);
+    return;
+  }
+}
+
+function flushPendingWebSearchText(
+  state: StreamBridgeState,
+  out: string[],
+): void {
+  if (!state.webSearchBuffer && !state.insideWebSearch) return;
+  const content = state.insideWebSearch
+    ? WEB_SEARCH_OPEN + state.webSearchBuffer
+    : state.webSearchBuffer;
+  state.webSearchBuffer = "";
+  state.insideWebSearch = false;
+  emitTextDelta(state, out, content);
+}
+
 /**
  * Convert one Chat Completions SSE JSON chunk into zero or more Responses SSE frames.
  */
@@ -186,33 +380,16 @@ export function chatChunkToResponsesEvents(
     const finish = choice.finish_reason as string | null | undefined;
 
     if (typeof delta.content === "string" && delta.content.length > 0) {
-      ensureTextItem(state, out);
-      state.fullText += delta.content;
-      out.push(
-        sseEvent("response.output_text.delta", {
-          item_id: state.textItemId,
-          output_index: state.outputIndex,
-          content_index: state.textContentIndex,
-          delta: delta.content,
-        }),
-      );
+      consumeTextContent(state, out, delta.content);
     }
 
     // Completions-style: choices[].text
     if (typeof choice.text === "string" && choice.text.length > 0) {
-      ensureTextItem(state, out);
-      state.fullText += choice.text;
-      out.push(
-        sseEvent("response.output_text.delta", {
-          item_id: state.textItemId,
-          output_index: state.outputIndex,
-          content_index: state.textContentIndex,
-          delta: choice.text,
-        }),
-      );
+      consumeTextContent(state, out, choice.text);
     }
 
     const toolCalls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+    if (toolCalls.length > 0) flushPendingWebSearchText(state, out);
     for (const tcRaw of toolCalls) {
       const tc = tcRaw as Record<string, unknown>;
       const idx = typeof tc.index === "number" ? tc.index : 0;
@@ -344,12 +521,21 @@ export function chatChunkToResponsesEvents(
 function closeTextItem(state: StreamBridgeState, out: string[]): void {
   if (!state.textStarted || !state.textItemId) return;
   const outputIndex = state.outputIndex;
+  const item = {
+    id: state.textItemId,
+    type: "message",
+    status: "completed",
+    role: "assistant",
+    content: [
+      { type: "output_text", text: state.currentText, annotations: [] },
+    ],
+  };
   out.push(
     sseEvent("response.output_text.done", {
       item_id: state.textItemId,
       output_index: outputIndex,
       content_index: state.textContentIndex,
-      text: state.fullText,
+      text: state.currentText,
     }),
   );
   out.push(
@@ -357,26 +543,20 @@ function closeTextItem(state: StreamBridgeState, out: string[]): void {
       item_id: state.textItemId,
       output_index: outputIndex,
       content_index: state.textContentIndex,
-      part: { type: "output_text", text: state.fullText, annotations: [] },
+      part: { type: "output_text", text: state.currentText, annotations: [] },
     }),
   );
   out.push(
     sseEvent("response.output_item.done", {
       output_index: outputIndex,
-      item: {
-        id: state.textItemId,
-        type: "message",
-        status: "completed",
-        role: "assistant",
-        content: [
-          { type: "output_text", text: state.fullText, annotations: [] },
-        ],
-      },
+      item,
     }),
   );
+  state.completedItems.push({ outputIndex, item });
   state.outputIndex += 1;
   state.textStarted = false;
   state.textItemId = null;
+  state.currentText = "";
 }
 
 function finalizeStream(
@@ -386,6 +566,7 @@ function finalizeStream(
 ): void {
   if (state.completed) return;
 
+  flushPendingWebSearchText(state, out);
   if (state.textStarted && state.textItemId) {
     closeTextItem(state, out);
   }
@@ -399,6 +580,14 @@ function finalizeStream(
 
     if (entry.custom) {
       const input = unwrapCustomToolInput(entry.arguments);
+      const item = {
+        id: entry.itemId,
+        type: "custom_tool_call",
+        status: "completed",
+        call_id: entry.callId,
+        name: entry.name || "tool",
+        input,
+      };
       out.push(
         sseEvent("response.custom_tool_call_input.delta", {
           item_id: entry.itemId,
@@ -418,17 +607,19 @@ function finalizeStream(
       out.push(
         sseEvent("response.output_item.done", {
           output_index: outputIndex,
-          item: {
-            id: entry.itemId,
-            type: "custom_tool_call",
-            status: "completed",
-            call_id: entry.callId,
-            name: entry.name || "tool",
-            input,
-          },
+          item,
         }),
       );
+      state.completedItems.push({ outputIndex, item });
     } else {
+      const item = {
+        id: entry.itemId,
+        type: "function_call",
+        status: "completed",
+        call_id: entry.callId,
+        name: entry.name || "tool",
+        arguments: entry.arguments,
+      };
       out.push(
         sseEvent("response.function_call_arguments.done", {
           item_id: entry.itemId,
@@ -439,16 +630,10 @@ function finalizeStream(
       out.push(
         sseEvent("response.output_item.done", {
           output_index: outputIndex,
-          item: {
-            id: entry.itemId,
-            type: "function_call",
-            status: "completed",
-            call_id: entry.callId,
-            name: entry.name || "tool",
-            arguments: entry.arguments,
-          },
+          item,
         }),
       );
+      state.completedItems.push({ outputIndex, item });
     }
     if (entry.outputIndex < 0) {
       entry.outputIndex = outputIndex;
@@ -461,37 +646,10 @@ function finalizeStream(
       ? "incomplete"
       : "completed";
 
-  const output: unknown[] = [];
-  if (state.fullText) {
-    output.push({
-      id: newId("msg"),
-      type: "message",
-      status: "completed",
-      role: "assistant",
-      content: [{ type: "output_text", text: state.fullText, annotations: [] }],
-    });
-  }
-  for (const entry of state.toolCalls.values()) {
-    if (entry.custom) {
-      output.push({
-        id: entry.itemId,
-        type: "custom_tool_call",
-        status: "completed",
-        call_id: entry.callId,
-        name: entry.name || "tool",
-        input: unwrapCustomToolInput(entry.arguments),
-      });
-    } else {
-      output.push({
-        id: entry.itemId,
-        type: "function_call",
-        status: "completed",
-        call_id: entry.callId,
-        name: entry.name || "tool",
-        arguments: entry.arguments,
-      });
-    }
-  }
+  const output = state.completedItems
+    .slice()
+    .sort((a, b) => a.outputIndex - b.outputIndex)
+    .map(({ item }) => item);
 
   const response = {
     ...baseResponse(state, status),
@@ -517,6 +675,7 @@ export function chatCompletionToResponse(
   chat: Record<string, unknown>,
   modelFallback?: string,
   customTools?: Iterable<string>,
+  webSearchEnabled = false,
 ): Record<string, unknown> {
   const id = newId("resp");
   const model = String(chat.model || modelFallback || "");
@@ -540,13 +699,24 @@ export function chatCompletionToResponse(
       ? message.content
       : textFromCompletions;
 
-  if (content) {
+  for (const segment of splitWebSearchContent(content, webSearchEnabled)) {
+    if (segment.type === "web_search") {
+      output.push({
+        id: newId("ws"),
+        type: "web_search_call",
+        status: "completed",
+        action: webSearchAction(segment.content),
+      });
+      if (!segment.content) continue;
+    }
     output.push({
       id: newId("msg"),
       type: "message",
       status: "completed",
       role: "assistant",
-      content: [{ type: "output_text", text: content, annotations: [] }],
+      content: [
+        { type: "output_text", text: segment.content, annotations: [] },
+      ],
     });
   }
 

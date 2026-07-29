@@ -316,7 +316,12 @@ async function forwardChatResponses(
     sendJson(
       res,
       200,
-      chatCompletionToResponse(json, String(body.model || ""), customTools),
+      chatCompletionToResponse(
+        json,
+        String(body.model || ""),
+        customTools,
+        true,
+      ),
     );
     return;
   }
@@ -326,6 +331,7 @@ async function forwardChatResponses(
     res,
     String(body.model || ""),
     customTools,
+    true,
   );
 }
 
@@ -373,7 +379,12 @@ async function forwardCompletions(
     sendJson(
       res,
       200,
-      chatCompletionToResponse(json, String(body.model || ""), customTools),
+      chatCompletionToResponse(
+        json,
+        String(body.model || ""),
+        customTools,
+        true,
+      ),
     );
     return;
   }
@@ -383,6 +394,7 @@ async function forwardCompletions(
     res,
     String(body.model || ""),
     customTools,
+    true,
   );
 }
 
@@ -391,6 +403,7 @@ async function pipeChatStreamToResponses(
   res: ServerResponse,
   model: string,
   customTools?: Iterable<string>,
+  webSearchEnabled = false,
 ): Promise<void> {
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -399,7 +412,12 @@ async function pipeChatStreamToResponses(
     "X-Accel-Buffering": "no",
   });
 
-  const state = createStreamState(model, undefined, customTools);
+  const state = createStreamState(
+    model,
+    undefined,
+    customTools,
+    webSearchEnabled,
+  );
   const reader = upstream.body?.getReader();
   if (!reader) {
     for (const frame of forceCompleteStream(state)) res.write(frame);
