@@ -1,13 +1,13 @@
 import type { ApiFormat, ProxyConfig } from "../types.js";
-import { emptyProxy } from "../types.js";
+import { requestWithNodeTransport } from "../bridge/transport.js";
 import { normalizeBaseUrlForFormat } from "./base-url.js";
-import { buildProxyEnv } from "./proxy.js";
 
 export interface FetchModelsOptions {
   baseUrl: string;
   apiKey: string;
   apiFormat: ApiFormat;
   proxy?: ProxyConfig;
+  headers?: Record<string, string>;
   timeoutMs?: number;
 }
 
@@ -74,19 +74,29 @@ export function modelListEndpoints(baseUrl: string): string[] {
 export function buildModelsRequestHeaders(
   apiFormat: ApiFormat,
   apiKey: string,
+  customHeaders: Record<string, string> = {},
 ): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: "application/json",
   };
-  if (!apiKey) return headers;
-
-  if (apiFormat === "anthropic") {
-    headers["x-api-key"] = apiKey;
-    headers["anthropic-version"] = "2023-06-01";
-    // Some gateways also accept Bearer
-    headers.Authorization = `Bearer ${apiKey}`;
-  } else {
-    headers.Authorization = `Bearer ${apiKey}`;
+  if (apiKey) {
+    if (apiFormat === "anthropic") {
+      headers["x-api-key"] = apiKey;
+      headers["anthropic-version"] = "2023-06-01";
+      headers.Authorization = `Bearer ${apiKey}`;
+    } else {
+      headers.Authorization = `Bearer ${apiKey}`;
+    }
+  }
+  for (const [name, value] of Object.entries(customHeaders)) {
+    if (/[\r\n]/.test(name) || /[\r\n]/.test(value)) {
+      throw new Error(`无效的模型请求 header: ${name}`);
+    }
+    const existing = Object.keys(headers).find(
+      (key) => key.toLowerCase() === name.toLowerCase(),
+    );
+    if (existing) delete headers[existing];
+    headers[name] = value;
   }
   return headers;
 }
@@ -122,7 +132,14 @@ export function parseModelIds(payload: unknown): string[] {
 export async function fetchModelList(
   options: FetchModelsOptions,
 ): Promise<FetchModelsResult> {
-  const { baseUrl, apiKey, apiFormat, proxy, timeoutMs = 20_000 } = options;
+  const {
+    baseUrl,
+    apiKey,
+    apiFormat,
+    proxy,
+    headers: customHeaders,
+    timeoutMs = 20_000,
+  } = options;
   if (!baseUrl?.trim()) {
     throw new Error("Base URL 为空，无法拉取模型列表");
   }
@@ -132,34 +149,34 @@ export async function fetchModelList(
 
   const effectiveBaseUrl = normalizeBaseUrlForFormat(apiFormat, baseUrl);
   const endpoints = modelListEndpoints(effectiveBaseUrl);
-  const headers = buildModelsRequestHeaders(apiFormat, apiKey.trim());
-  const restore = applyProxyEnv(proxy);
+  const headers = buildModelsRequestHeaders(
+    apiFormat,
+    apiKey.trim(),
+    customHeaders,
+  );
 
   const errors: string[] = [];
-  try {
-    for (const endpoint of endpoints) {
-      try {
-        const models = await requestModels(endpoint, headers, timeoutMs);
-        if (models.length > 0) {
-          const resolvedBaseUrl =
-            baseUrlFromModelsEndpoint(endpoint) || effectiveBaseUrl;
-          return {
-            models,
-            endpoint,
-            resolvedBaseUrl: normalizeBaseUrlForFormat(
-              apiFormat,
-              resolvedBaseUrl,
-            ),
-          };
-        }
-        errors.push(`${endpoint} → 返回空列表`);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        errors.push(`${endpoint} → ${msg}`);
+  for (const endpoint of endpoints) {
+    try {
+      const models = await requestModels(endpoint, headers, timeoutMs, proxy);
+      if (models.length > 0) {
+        // Anthropic Messages base URLs are not implied by a sibling /v1/models
+        // endpoint; keep the operator-provided base for those.
+        const resolvedBaseUrl =
+          apiFormat === "anthropic"
+            ? effectiveBaseUrl
+            : baseUrlFromModelsEndpoint(endpoint) || effectiveBaseUrl;
+        return {
+          models,
+          endpoint,
+          resolvedBaseUrl: normalizeBaseUrlForFormat(apiFormat, resolvedBaseUrl),
+        };
       }
+      errors.push(`${endpoint} → 返回空列表`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      errors.push(`${endpoint} → ${msg}`);
     }
-  } finally {
-    restore();
   }
 
   throw new Error(
@@ -171,14 +188,18 @@ async function requestModels(
   endpoint: string,
   headers: Record<string, string>,
   timeoutMs: number,
+  proxy?: ProxyConfig,
 ): Promise<string[]> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(endpoint, {
+    const res = await requestWithNodeTransport({
+      url: endpoint,
       method: "GET",
       headers,
+      proxy,
       signal: controller.signal,
+      totalTimeoutMs: timeoutMs,
     });
     if (!res.ok) {
       const body = (await res.text().catch(() => "")).slice(0, 200);
@@ -194,22 +215,4 @@ async function requestModels(
   } finally {
     clearTimeout(timer);
   }
-}
-
-function applyProxyEnv(proxy?: ProxyConfig): () => void {
-  if (emptyProxy(proxy)) return () => undefined;
-
-  const next = buildProxyEnv(proxy);
-  const keys = Object.keys(next);
-  const backup = new Map<string, string | undefined>();
-  for (const key of keys) {
-    backup.set(key, process.env[key]);
-    process.env[key] = next[key];
-  }
-  return () => {
-    for (const [key, value] of backup) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  };
 }

@@ -13,39 +13,22 @@ export const PROXY_ENV_KEYS = [
 export type ProxyEnvMap = Record<string, string>;
 
 /**
- * Build proxy env vars for injection into tool configs.
- * Prefer explicit http/https; when only `all` is set (e.g. socks5h),
- * set ALL_PROXY (and lowercase) and also mirror to HTTP(S)_PROXY
- * so runtimes that only read those still attempt the proxy URL.
+ * Build proxy env vars for injection into tool configs. A single proxy URL is
+ * applied to all traffic, so HTTP_PROXY, HTTPS_PROXY and ALL_PROXY (plus their
+ * lowercase forms) are all set to that URL. SOCKS URLs are honored by runtimes
+ * that read these variables.
  */
 export function buildProxyEnv(proxy?: ProxyConfig): ProxyEnvMap {
   if (emptyProxy(proxy)) return {};
-
-  const env: ProxyEnvMap = {};
-  const http = proxy!.http?.trim();
-  const https = proxy!.https?.trim();
-  const all = proxy!.all?.trim();
-
-  if (all) {
-    env.ALL_PROXY = all;
-    env.all_proxy = all;
-  }
-  if (http) {
-    env.HTTP_PROXY = http;
-    env.http_proxy = http;
-  } else if (all) {
-    env.HTTP_PROXY = all;
-    env.http_proxy = all;
-  }
-  if (https) {
-    env.HTTPS_PROXY = https;
-    env.https_proxy = https;
-  } else if (all) {
-    env.HTTPS_PROXY = all;
-    env.https_proxy = all;
-  }
-
-  return env;
+  const url = proxy!.trim();
+  return {
+    HTTP_PROXY: url,
+    HTTPS_PROXY: url,
+    ALL_PROXY: url,
+    http_proxy: url,
+    https_proxy: url,
+    all_proxy: url,
+  };
 }
 
 export function clearProxyEnvKeys(
@@ -69,9 +52,5 @@ export function applyProxyToEnvRecord(
 
 export function formatProxySummary(proxy?: ProxyConfig): string {
   if (emptyProxy(proxy)) return "(none)";
-  const parts: string[] = [];
-  if (proxy?.http) parts.push(`http=${proxy.http}`);
-  if (proxy?.https) parts.push(`https=${proxy.https}`);
-  if (proxy?.all) parts.push(`all=${proxy.all}`);
-  return parts.join(", ");
+  return proxy!.trim();
 }

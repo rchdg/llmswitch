@@ -75,6 +75,7 @@ export function buildCodexConfig(
 export function buildCodexEnvFile(
   existingContent: string,
   profile: Profile,
+  effectiveApiKey = profile.apiKey || "llm-switch-bridge",
 ): string {
   const lines = existingContent ? existingContent.split(/\r?\n/) : [];
   const map = new Map<string, string>();
@@ -102,7 +103,7 @@ export function buildCodexEnvFile(
   // When bridging, Codex talks to local bridge; key can be placeholder.
   // Bridge uses upstream.apiKey from its own config. Still write real key
   // so native responses profiles keep working.
-  map.set(keyName, profile.apiKey || "llm-switch-bridge");
+  map.set(keyName, effectiveApiKey);
 
   const proxyKeys = [
     "HTTP_PROXY",
@@ -158,14 +159,16 @@ export async function applyCodexProfile(
     profile.apiFormat,
     profile.baseUrl,
   );
+  let effectiveApiKey = profile.apiKey || "llm-switch-bridge";
   let bridgeNote = "";
 
   if (profileNeedsBridge(profile)) {
-    effectiveBaseUrl = (await ensureBridgeForProfile(profile, "codex")).replace(
-      /\/+$/,
-      "",
-    );
+    const connection = await ensureBridgeForProfile(profile, "codex");
+    effectiveBaseUrl = connection.baseUrl.replace(/\/+$/, "");
+    effectiveApiKey = connection.clientToken;
     bridgeNote = `已启动本地 Responses 适配桥 → ${effectiveBaseUrl}（上游 ${normalizeBaseUrlForFormat(profile.apiFormat, profile.baseUrl)}，模式 ${profile.bridgeMode || "chat"}）。`;
+  } else {
+    await clearBridgeUpstream("codex");
   }
 
   const configPath = getCodexConfigPath();
@@ -182,7 +185,10 @@ export async function applyCodexProfile(
   atomicWriteFile(configPath, stringify(next) + "\n");
 
   const prevEnv = existsSync(envPath) ? readFileSync(envPath, "utf8") : "";
-  atomicWriteFile(envPath, buildCodexEnvFile(prevEnv, profile));
+  atomicWriteFile(
+    envPath,
+    buildCodexEnvFile(prevEnv, profile, effectiveApiKey),
+  );
 
   setActiveProfile("codex", profile.name);
 

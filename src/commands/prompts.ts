@@ -1,5 +1,6 @@
 import * as p from "@clack/prompts";
 import type { ApiFormat, Profile, ProxyConfig, Tool } from "../types.js";
+import { normalizeProxyValue } from "../types.js";
 import { isApiFormat } from "../types.js";
 import { formatLabel, supportedFormats } from "../formats/compatibility.js";
 import { getPreset, presetsForTool } from "../presets/index.js";
@@ -230,9 +231,7 @@ export async function promptProfileDraft(
     apiKey: string;
     model: string;
     models: string[];
-    proxyHttp: string;
-    proxyHttps: string;
-    proxyAll: string;
+    proxy: string;
     preset: string;
     bridgeMode: "chat" | "completions";
   }> = {},
@@ -374,18 +373,12 @@ export async function promptProfileDraft(
   }
 
   // Proxy before model fetch so listing can go through the same upstream proxy.
-  let proxyHttp = partial.proxyHttp;
-  let proxyHttps = partial.proxyHttps;
-  let proxyAll = partial.proxyAll;
+  let proxyUrl = partial.proxy;
 
-  if (
-    proxyHttp === undefined &&
-    proxyHttps === undefined &&
-    proxyAll === undefined
-  ) {
+  if (proxyUrl === undefined) {
     const wantProxy = await p.confirm({
       message:
-        "是否配置上游代理？（拉取模型与后续工具请求均可走 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY）",
+        "是否配置上游代理？（拉取模型与后续该 provider 的请求都会走此代理）",
       initialValue: false,
     });
     if (p.isCancel(wantProxy)) {
@@ -393,31 +386,16 @@ export async function promptProfileDraft(
       process.exit(0);
     }
     if (wantProxy) {
-      proxyAll =
+      proxyUrl =
         (await promptText({
-          message: "ALL_PROXY（如 socks5h://127.0.0.1:1080，可留空）",
-          placeholder: "socks5h://127.0.0.1:1080",
-        })) || undefined;
-
-      proxyHttp =
-        (await promptText({
-          message: "HTTP_PROXY（可留空）",
-          placeholder: "http://127.0.0.1:5112",
-        })) || undefined;
-
-      proxyHttps =
-        (await promptText({
-          message: "HTTPS_PROXY（可留空）",
-          placeholder: "http://127.0.0.1:5112",
+          message: "代理地址（支持 http/https/socks5，可留空）",
+          placeholder: "socks5://127.0.0.1:1080",
+          validate: validateProxyUrl,
         })) || undefined;
     }
   }
 
-  const proxy = buildProxyConfig({
-    http: proxyHttp,
-    https: proxyHttps,
-    all: proxyAll,
-  });
+  const proxy = buildProxyConfig({ url: proxyUrl });
 
   if (tool === "codex" && apiFormat === "openai-chat" && !bridgeMode) {
     bridgeMode = "chat";
@@ -522,23 +500,13 @@ export async function promptEditProfile(
     apiKey = v || "";
   }
 
-  const http = await promptText({
-    message: "HTTP_PROXY（留空清除）",
-    initialValue: current.proxy?.http || "",
+  const proxyInput = await promptText({
+    message: "代理地址（支持 http/https/socks5，留空清除）",
+    placeholder: "socks5://127.0.0.1:1080",
+    initialValue: current.proxy || "",
+    validate: validateProxyUrl,
   });
-  const https = await promptText({
-    message: "HTTPS_PROXY（留空清除）",
-    initialValue: current.proxy?.https || "",
-  });
-  const all = await promptText({
-    message: "ALL_PROXY（留空清除）",
-    initialValue: current.proxy?.all || "",
-  });
-  const proxy = buildProxyConfig({
-    http: http || undefined,
-    https: https || undefined,
-    all: all || undefined,
-  });
+  const proxy = buildProxyConfig({ url: proxyInput || undefined });
 
   const next: Profile = {
     ...current,
@@ -750,15 +718,39 @@ export async function tryFetchModels(input: {
   }
 }
 
+const SUPPORTED_PROXY_SCHEMES = [
+  "http",
+  "https",
+  "socks",
+  "socks4",
+  "socks4a",
+  "socks5",
+  "socks5h",
+] as const;
+
+/**
+ * Validate a single proxy URL for the interactive prompts. Empty is allowed
+ * (clears the proxy). Returns an error message string when invalid.
+ */
+export function validateProxyUrl(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return "代理地址格式无效，示例：http://127.0.0.1:7890 或 socks5://127.0.0.1:1080";
+  }
+  const scheme = url.protocol.replace(/:$/, "").toLowerCase();
+  if (!(SUPPORTED_PROXY_SCHEMES as readonly string[]).includes(scheme)) {
+    return `不支持的代理协议「${scheme}」。支持：http、https、socks5（含 socks/socks4/socks4a/socks5h）`;
+  }
+  return undefined;
+}
+
+/** Normalize a single proxy URL input into the stored value. */
 export function buildProxyConfig(input: {
-  http?: string;
-  https?: string;
-  all?: string;
+  url?: string;
 }): ProxyConfig | undefined {
-  const proxy: ProxyConfig = {};
-  if (input.http?.trim()) proxy.http = input.http.trim();
-  if (input.https?.trim()) proxy.https = input.https.trim();
-  if (input.all?.trim()) proxy.all = input.all.trim();
-  if (!proxy.http && !proxy.https && !proxy.all) return undefined;
-  return proxy;
+  return normalizeProxyValue(input.url);
 }

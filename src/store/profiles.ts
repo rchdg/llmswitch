@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, unlinkSync } from "node:fs";
 import { readFileSync } from "node:fs";
 import type { Profile, Tool, ToolState } from "../types.js";
-import { isApiFormat } from "../types.js";
+import { isApiFormat, normalizeProxyValue } from "../types.js";
 import { normalizeBaseUrlForFormat } from "../utils/base-url.js";
 import { atomicWriteFile, ensureDir, maskSecret } from "../utils/fs.js";
 import {
@@ -234,7 +234,7 @@ function normalizeProfile(raw: Profile, fallbackName: string): Profile {
       fast: raw.models?.fast || undefined,
       list: list.length ? list : raw.models?.default ? [raw.models.default] : [],
     },
-    proxy: raw.proxy,
+    proxy: normalizeProxyValue(raw.proxy),
     bridgeMode: raw.bridgeMode,
     headers: raw.headers || {},
     updatedAt: raw.updatedAt || new Date(0).toISOString(),

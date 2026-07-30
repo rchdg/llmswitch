@@ -4,9 +4,16 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
-import { buildProxyEnv } from "../utils/proxy.js";
-import { emptyProxy } from "../types.js";
-import { readBridgeState, readBridgeUpstreams } from "./state.js";
+import { parseBridgeRuntimeLimits } from "./runtime.js";
+import {
+  requestWithNodeTransport,
+  type NodeTransportResponse,
+} from "./transport.js";
+import {
+  constantTimeTokenEqual,
+  readBridgeState,
+  readBridgeUpstreams,
+} from "./state.js";
 import type { BridgeUpstream, BridgeUpstreams } from "./types.js";
 import { anthropicToChatRequest } from "./anthropic-translate-request.js";
 import {
@@ -29,12 +36,103 @@ import {
   parseChatSseLine as parseChatSseLineResponses,
 } from "./translate-response.js";
 
-function readBody(req: IncomingMessage): Promise<Buffer> {
+export interface BridgeServerOptions {
+  controlToken?: string;
+  instanceId?: string;
+  onShutdown?: (instanceId: string) => void | Promise<void>;
+}
+
+function headerValue(
+  value: string | string[] | undefined,
+): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function controlToken(req: IncomingMessage): string | undefined {
+  return headerValue(req.headers["x-llm-switch-control"]);
+}
+
+class RequestBodyTooLargeError extends Error {
+  constructor(readonly maxBytes: number) {
+    super(`Request body exceeded ${maxBytes} bytes`);
+    this.name = "RequestBodyTooLargeError";
+  }
+}
+
+function bearerToken(req: IncomingMessage): string | undefined {
+  const authorization = headerValue(req.headers.authorization);
+  const match = authorization?.match(/^Bearer\s+([^\s]+)$/i);
+  return match?.[1];
+}
+
+function authenticateDataRequest(
+  req: IncomingMessage,
+  upstream: BridgeUpstream | null,
+  tool: "codex" | "claude",
+): boolean {
+  if (!upstream?.clientToken || upstream.migrationRequired) return false;
+  const bearer = bearerToken(req);
+  if (tool === "codex") {
+    return constantTimeTokenEqual(upstream.clientToken, bearer);
+  }
+  const apiKey = headerValue(req.headers["x-api-key"]);
+  if (bearer && apiKey && !constantTimeTokenEqual(bearer, apiKey)) {
+    return false;
+  }
+  return constantTimeTokenEqual(upstream.clientToken, bearer || apiKey);
+}
+
+function authenticateModelsRequest(
+  req: IncomingMessage,
+  upstreams: BridgeUpstreams,
+): boolean {
+  return (
+    authenticateDataRequest(req, upstreams.codex, "codex") ||
+    authenticateDataRequest(req, upstreams.claude, "claude")
+  );
+}
+
+function readBody(
+  req: IncomingMessage,
+  maxBytes = parseBridgeRuntimeLimits().maxBodyBytes,
+): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
+    let bytes = 0;
+    let settled = false;
+    const onData = (value: Buffer | string) => {
+      if (settled) return;
+      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      bytes += chunk.length;
+      if (bytes > maxBytes) {
+        settled = true;
+        cleanup();
+        req.resume();
+        reject(new RequestBodyTooLargeError(maxBytes));
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(Buffer.concat(chunks));
+    };
+    const onError = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const cleanup = () => {
+      req.off("data", onData);
+      req.off("end", onEnd);
+      req.off("error", onError);
+    };
+    req.on("data", onData);
+    req.on("end", onEnd);
+    req.on("error", onError);
   });
 }
 
@@ -59,65 +157,54 @@ function joinUrl(baseUrl: string, path: string): string {
   return `${base}${p}`;
 }
 
-function upstreamHeaders(
-  upstream: BridgeUpstream,
-  incoming: IncomingMessage,
-): Record<string, string> {
+function upstreamHeaders(upstream: BridgeUpstream): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: "application/json",
     "Content-Type": "application/json",
   };
-  const incomingAuth = incoming.headers.authorization;
-  const incomingKey = incoming.headers["x-api-key"];
-  if (incomingAuth) {
-    headers.Authorization = Array.isArray(incomingAuth)
-      ? incomingAuth[0]!
-      : incomingAuth;
-  } else if (incomingKey) {
-    const key = Array.isArray(incomingKey) ? incomingKey[0]! : incomingKey;
-    headers.Authorization = `Bearer ${key}`;
-  } else if (upstream.apiKey) {
-    headers.Authorization = `Bearer ${upstream.apiKey}`;
-  }
-
+  let hasAuthorization = false;
   if (upstream.headers) {
-    for (const [k, v] of Object.entries(upstream.headers)) {
-      headers[k] = v;
+    for (const [name, value] of Object.entries(upstream.headers)) {
+      if (/^(connection|keep-alive|proxy-authenticate|proxy-authorization|te|trailer|transfer-encoding|upgrade)$/i.test(name)) {
+        continue;
+      }
+      headers[name] = value;
+      if (name.toLowerCase() === "authorization") hasAuthorization = true;
     }
+  }
+  if (upstream.apiKey && !hasAuthorization) {
+    headers.Authorization = `Bearer ${upstream.apiKey}`;
   }
   return headers;
 }
 
-function withProxyEnv<T>(
+function requestUpstream(
   upstream: BridgeUpstream,
-  fn: () => Promise<T>,
-): Promise<T> {
-  if (emptyProxy(upstream.proxy)) return fn();
-  const next = buildProxyEnv(upstream.proxy);
-  const backup = new Map<string, string | undefined>();
-  for (const [k, v] of Object.entries(next)) {
-    backup.set(k, process.env[k]);
-    process.env[k] = v;
-  }
-  return fn().finally(() => {
-    for (const [k, v] of backup) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
+  url: string,
+  method: "GET" | "POST",
+  body?: string,
+  signal?: AbortSignal,
+): Promise<NodeTransportResponse> {
+  const limits = parseBridgeRuntimeLimits();
+  return requestWithNodeTransport({
+    url,
+    method,
+    headers: upstreamHeaders(upstream),
+    body,
+    proxy: upstream.proxy,
+    signal,
+    connectTimeoutMs: limits.connectTimeoutMs,
+    idleTimeoutMs: limits.idleTimeoutMs,
+    totalTimeoutMs: limits.totalTimeoutMs,
+    maxResponseBytes: limits.maxResponseBytes,
   });
 }
 
 async function fetchModelsJson(
   upstream: BridgeUpstream,
-  req: IncomingMessage,
 ): Promise<{ ok: boolean; status: number; data: unknown[] }> {
   const url = joinUrl(upstream.baseUrl, "/models");
-  const response = await withProxyEnv(upstream, () =>
-    fetch(url, {
-      method: "GET",
-      headers: upstreamHeaders(upstream, req),
-    }),
-  );
+  const response = await requestUpstream(upstream, url, "GET");
   if (!response.ok) {
     return { ok: false, status: response.status, data: [] };
   }
@@ -131,7 +218,7 @@ async function fetchModelsJson(
 }
 
 async function proxyModelsMerged(
-  req: IncomingMessage,
+  _req: IncomingMessage,
   res: ServerResponse,
   upstreams: BridgeUpstreams,
 ): Promise<void> {
@@ -146,7 +233,7 @@ async function proxyModelsMerged(
   }
 
   const results = await Promise.all(
-    sides.map((u) => fetchModelsJson(u, req).catch(() => ({
+    sides.map((u) => fetchModelsJson(u).catch(() => ({
       ok: false as const,
       status: 502,
       data: [] as unknown[],
@@ -201,7 +288,7 @@ async function handleResponses(
 }
 
 async function handleMessages(
-  req: IncomingMessage,
+  _req: IncomingMessage,
   res: ServerResponse,
   upstream: BridgeUpstream,
   bodyBuf: Buffer,
@@ -221,14 +308,13 @@ async function handleMessages(
   const chatReq = anthropicToChatRequest(body);
   const url = joinUrl(upstream.baseUrl, "/chat/completions");
 
-  let response: Response;
+  let response: NodeTransportResponse;
   try {
-    response = await withProxyEnv(upstream, () =>
-      fetch(url, {
-        method: "POST",
-        headers: upstreamHeaders(upstream, req),
-        body: JSON.stringify(chatReq),
-      }),
+    response = await requestUpstream(
+      upstream,
+      url,
+      "POST",
+      JSON.stringify(chatReq),
     );
   } catch (err) {
     sendJson(res, 502, {
@@ -279,14 +365,13 @@ async function forwardChatResponses(
   const customTools = collectCustomToolNames(body.tools);
   const url = joinUrl(upstream.baseUrl, "/chat/completions");
 
-  let response: Response;
+  let response: NodeTransportResponse;
   try {
-    response = await withProxyEnv(upstream, () =>
-      fetch(url, {
-        method: "POST",
-        headers: upstreamHeaders(upstream, req),
-        body: JSON.stringify(chatReq),
-      }),
+    response = await requestUpstream(
+      upstream,
+      url,
+      "POST",
+      JSON.stringify(chatReq),
     );
   } catch (err) {
     sendJson(res, 502, {
@@ -336,7 +421,7 @@ async function forwardChatResponses(
 }
 
 async function forwardCompletions(
-  req: IncomingMessage,
+  _req: IncomingMessage,
   res: ServerResponse,
   upstream: BridgeUpstream,
   body: Record<string, unknown>,
@@ -346,14 +431,13 @@ async function forwardCompletions(
   const customTools = collectCustomToolNames(body.tools);
   const url = joinUrl(upstream.baseUrl, "/completions");
 
-  let response: Response;
+  let response: NodeTransportResponse;
   try {
-    response = await withProxyEnv(upstream, () =>
-      fetch(url, {
-        method: "POST",
-        headers: upstreamHeaders(upstream, req),
-        body: JSON.stringify(completionReq),
-      }),
+    response = await requestUpstream(
+      upstream,
+      url,
+      "POST",
+      JSON.stringify(completionReq),
     );
   } catch (err) {
     sendJson(res, 502, {
@@ -399,7 +483,7 @@ async function forwardCompletions(
 }
 
 async function pipeChatStreamToResponses(
-  upstream: Response,
+  upstream: NodeTransportResponse,
   res: ServerResponse,
   model: string,
   customTools?: Iterable<string>,
@@ -467,7 +551,7 @@ async function pipeChatStreamToResponses(
 }
 
 async function pipeChatStreamToAnthropic(
-  upstream: Response,
+  upstream: NodeTransportResponse,
   res: ServerResponse,
   model: string,
 ): Promise<void> {
@@ -532,15 +616,15 @@ async function pipeChatStreamToAnthropic(
   }
 }
 
-export function createBridgeServer(): Server {
+export function createBridgeServer(options: BridgeServerOptions = {}): Server {
   return createServer(async (req, res) => {
     try {
-      const upstreams = readBridgeUpstreams();
       const state = readBridgeState();
-      const merged = {
-        codex: upstreams.codex || state.upstreams.codex,
-        claude: upstreams.claude || state.upstreams.claude,
-      };
+      const expectedControlToken =
+        options.controlToken ?? state.instance?.controlToken;
+      const expectedInstanceId = options.instanceId ?? state.instance?.id;
+      const upstreams = readBridgeUpstreams();
+      const merged = upstreams;
 
       const url = new URL(
         req.url || "/",
@@ -549,21 +633,38 @@ export function createBridgeServer(): Server {
       const path = url.pathname.replace(/\/+$/, "") || "/";
 
       if (req.method === "GET" && (path === "/health" || path === "/v1/health")) {
+        const suppliedControl = controlToken(req);
+        if (!suppliedControl) {
+          sendJson(res, 200, { ok: true, service: "llm-switch-bridge" });
+          return;
+        }
+        if (
+          !expectedControlToken ||
+          !constantTimeTokenEqual(expectedControlToken, suppliedControl)
+        ) {
+          sendJson(res, 401, {
+            ok: false,
+            error: { code: "invalid_control_token", message: "Unauthorized" },
+          });
+          return;
+        }
         sendJson(res, 200, {
           ok: true,
+          service: "llm-switch-bridge",
+          instanceId: expectedInstanceId,
           upstreams: {
             codex: merged.codex
               ? {
-                  baseUrl: merged.codex.baseUrl,
                   mode: merged.codex.mode,
                   profile: merged.codex.profileName || null,
+                  migrationRequired: merged.codex.migrationRequired === true,
                 }
               : null,
             claude: merged.claude
               ? {
-                  baseUrl: merged.claude.baseUrl,
                   mode: merged.claude.mode,
                   profile: merged.claude.profileName || null,
+                  migrationRequired: merged.claude.migrationRequired === true,
                 }
               : null,
           },
@@ -571,7 +672,51 @@ export function createBridgeServer(): Server {
         return;
       }
 
+      if (req.method === "POST" && path === "/_control/shutdown") {
+        const suppliedControl = controlToken(req);
+        if (
+          !expectedControlToken ||
+          !constantTimeTokenEqual(expectedControlToken, suppliedControl)
+        ) {
+          sendJson(res, 401, {
+            ok: false,
+            error: { code: "invalid_control_token", message: "Unauthorized" },
+          });
+          return;
+        }
+        let instanceId = "";
+        try {
+          const body = JSON.parse((await readBody(req)).toString("utf8")) as {
+            instanceId?: unknown;
+          };
+          instanceId = typeof body.instanceId === "string" ? body.instanceId : "";
+        } catch {
+          sendJson(res, 400, { error: { message: "Invalid JSON body" } });
+          return;
+        }
+        if (!expectedInstanceId || instanceId !== expectedInstanceId) {
+          sendJson(res, 409, {
+            error: { code: "instance_mismatch", message: "Bridge instance mismatch" },
+          });
+          return;
+        }
+        sendJson(res, 202, { ok: true, instanceId });
+        queueMicrotask(() => {
+          void options.onShutdown?.(instanceId);
+        });
+        return;
+      }
+
       if (req.method === "GET" && (path === "/v1/models" || path === "/models")) {
+        if (!authenticateModelsRequest(req, merged)) {
+          sendJson(res, 401, {
+            error: {
+              code: "invalid_bridge_token",
+              message: "Bridge token 无效；升级后请重新执行 llms <tool> use <profile>",
+            },
+          });
+          return;
+        }
         await proxyModelsMerged(req, res, merged);
         return;
       }
@@ -585,6 +730,15 @@ export function createBridgeServer(): Server {
             error: {
               message:
                 "Bridge 未配置 Codex 上游。请先 llms codex use <openai-chat profile>",
+            },
+          });
+          return;
+        }
+        if (!authenticateDataRequest(req, merged.codex, "codex")) {
+          sendJson(res, 401, {
+            error: {
+              code: "invalid_bridge_token",
+              message: "Bridge token 无效；请重新执行 llms codex use <profile>",
             },
           });
           return;
@@ -609,6 +763,16 @@ export function createBridgeServer(): Server {
           });
           return;
         }
+        if (!authenticateDataRequest(req, merged.claude, "claude")) {
+          sendJson(res, 401, {
+            type: "error",
+            error: {
+              type: "authentication_error",
+              message: "Bridge token 无效；请重新执行 llms claude use <profile>",
+            },
+          });
+          return;
+        }
         const body = await readBody(req);
         await handleMessages(req, res, merged.claude, body);
         return;
@@ -620,6 +784,12 @@ export function createBridgeServer(): Server {
         },
       });
     } catch (err) {
+      if (err instanceof RequestBodyTooLargeError) {
+        sendJson(res, 413, {
+          error: { code: "request_too_large", message: err.message },
+        });
+        return;
+      }
       sendJson(res, 500, {
         error: {
           message: err instanceof Error ? err.message : String(err),
@@ -629,8 +799,12 @@ export function createBridgeServer(): Server {
   });
 }
 
-export function listenBridge(port: number, host: string): Promise<Server> {
-  const server = createBridgeServer();
+export function listenBridge(
+  port: number,
+  host: string,
+  options: BridgeServerOptions = {},
+): Promise<Server> {
+  const server = createBridgeServer(options);
   return new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, () => resolve(server));

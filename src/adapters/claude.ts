@@ -59,6 +59,7 @@ export function buildClaudeSettings(
   existing: SettingsJson,
   profile: Profile,
   effectiveBaseUrl?: string,
+  effectiveApiKey = profile.apiKey,
 ): SettingsJson {
   assertCompatible("claude", profile.apiFormat);
 
@@ -67,8 +68,8 @@ export function buildClaudeSettings(
 
   const needsBridge = profileNeedsBridge(profile);
   env.ANTHROPIC_BASE_URL = effectiveBaseUrl || profile.baseUrl;
-  if (profile.apiKey) {
-    env.ANTHROPIC_AUTH_TOKEN = profile.apiKey;
+  if (effectiveApiKey) {
+    env.ANTHROPIC_AUTH_TOKEN = effectiveApiKey;
   }
   env.ANTHROPIC_MODEL = profile.models.default;
   env.ANTHROPIC_DEFAULT_SONNET_MODEL = profile.models.default;
@@ -110,15 +111,23 @@ export async function applyClaudeProfile(
   );
 
   let effectiveBaseUrl = profile.baseUrl;
+  let effectiveApiKey = profile.apiKey;
   let bridgeNote = "";
   if (profileNeedsBridge(profile)) {
-    effectiveBaseUrl = await ensureBridgeForProfile(profile, "claude");
+    const connection = await ensureBridgeForProfile(profile, "claude");
+    effectiveBaseUrl = connection.baseUrl;
+    effectiveApiKey = connection.clientToken;
     bridgeNote = `已启动本地 Anthropic↔Chat 适配桥 → ${effectiveBaseUrl}（上游 ${profile.baseUrl}）。`;
   } else {
     await clearBridgeUpstream("claude");
   }
 
-  const next = buildClaudeSettings(existing, profile, effectiveBaseUrl);
+  const next = buildClaudeSettings(
+    existing,
+    profile,
+    effectiveBaseUrl,
+    effectiveApiKey,
+  );
   atomicWriteFile(configPath, JSON.stringify(next, null, 2) + "\n");
   setActiveProfile("claude", profile.name);
 

@@ -60,22 +60,23 @@ function sample(partial: Partial<Profile> & Pick<Profile, "name" | "apiFormat">)
 }
 
 describe("proxy env", () => {
-  test("socks all fills ALL and HTTP(S)", () => {
-    const env = buildProxyEnv({ all: "socks5h://127.0.0.1:1080" });
+  test("single socks url fills ALL and HTTP(S)", () => {
+    const env = buildProxyEnv("socks5h://127.0.0.1:1080");
     expect(env.ALL_PROXY).toBe("socks5h://127.0.0.1:1080");
     expect(env.HTTP_PROXY).toBe("socks5h://127.0.0.1:1080");
     expect(env.HTTPS_PROXY).toBe("socks5h://127.0.0.1:1080");
   });
 
-  test("explicit http/https preferred", () => {
-    const env = buildProxyEnv({
-      http: "http://127.0.0.1:5112",
-      https: "http://127.0.0.1:5112",
-      all: "socks5h://127.0.0.1:1080",
-    });
+  test("single http url applies to all proxy vars", () => {
+    const env = buildProxyEnv("http://127.0.0.1:5112");
     expect(env.HTTP_PROXY).toBe("http://127.0.0.1:5112");
     expect(env.HTTPS_PROXY).toBe("http://127.0.0.1:5112");
-    expect(env.ALL_PROXY).toBe("socks5h://127.0.0.1:1080");
+    expect(env.ALL_PROXY).toBe("http://127.0.0.1:5112");
+  });
+
+  test("empty proxy yields no vars", () => {
+    expect(buildProxyEnv(undefined)).toEqual({});
+    expect(buildProxyEnv("")).toEqual({});
   });
 });
 
@@ -137,7 +138,7 @@ describe("claude adapter", () => {
       name: "ds",
       apiFormat: "anthropic",
       baseUrl: "https://api.deepseek.com/anthropic",
-      proxy: { http: "http://127.0.0.1:5112" },
+      proxy: "http://127.0.0.1:5112",
     });
     const next = buildClaudeSettings(existing, profile);
     expect(next.theme).toBe("dark");
@@ -191,7 +192,7 @@ describe("codex adapter", () => {
     const profile = sample({
       name: "gw",
       apiFormat: "openai-responses",
-      proxy: { all: "socks5h://127.0.0.1:1080" },
+      proxy: "socks5h://127.0.0.1:1080",
     });
     const env = buildCodexEnvFile("OTHER=1\n", profile);
     expect(env).toContain("OTHER=1");

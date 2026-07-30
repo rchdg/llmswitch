@@ -7,14 +7,13 @@ import {
   runBridgeForeground,
   startBridgeDaemon,
   stopBridge,
-  upstreamFromProfile,
 } from "../bridge/manager.js";
 import {
   bridgeBaseUrl,
   bridgeRootUrl,
   readBridgeState,
-  writeBridgeUpstream,
 } from "../bridge/state.js";
+import { parseBridgePort } from "../bridge/runtime.js";
 import { DEFAULT_BRIDGE_HOST, DEFAULT_BRIDGE_PORT } from "../bridge/types.js";
 import { getActiveProfile, requireProfile } from "../store/profiles.js";
 import { isTool } from "../types.js";
@@ -35,29 +34,43 @@ export function registerBridgeCommand(program: Command): void {
       "监听端口",
       String(DEFAULT_BRIDGE_PORT),
     )
-    .action(async (opts: { host: string; port: string }) => {
-      const port = Number(opts.port) || DEFAULT_BRIDGE_PORT;
-      await runBridgeForeground(opts.host || DEFAULT_BRIDGE_HOST, port);
-    });
+    .option("--allow-remote", "允许非回环监听（仍强制认证和限制）")
+    .action(
+      async (opts: { host: string; port: string; allowRemote?: boolean }) => {
+        const port = parseBridgePort(opts.port);
+        await runBridgeForeground(
+          opts.host || DEFAULT_BRIDGE_HOST,
+          port,
+          Boolean(opts.allowRemote),
+        );
+      },
+    );
 
   bridge
     .command("start")
     .description("后台启动 bridge")
     .option("--host <host>", "监听地址", DEFAULT_BRIDGE_HOST)
     .option("--port <port>", "监听端口", String(DEFAULT_BRIDGE_PORT))
-    .action(async (opts: { host: string; port: string }) => {
-      const host = opts.host || DEFAULT_BRIDGE_HOST;
-      const port = Number(opts.port) || DEFAULT_BRIDGE_PORT;
-      const pid = await startBridgeDaemon(host, port);
-      for (let i = 0; i < 30; i++) {
-        if (await isBridgeAlive(host, port)) break;
-        await new Promise((r) => setTimeout(r, 100));
-      }
-      if (!(await isBridgeAlive(host, port))) {
-        throw new Error("bridge 启动失败，请尝试：llms bridge serve");
-      }
-      console.log(`bridge 已启动 pid=${pid} ${bridgeRootUrl()}`);
-    });
+    .option("--allow-remote", "允许非回环监听（仍强制认证和限制）")
+    .action(
+      async (opts: { host: string; port: string; allowRemote?: boolean }) => {
+        const host = opts.host || DEFAULT_BRIDGE_HOST;
+        const port = parseBridgePort(opts.port);
+        const pid = await startBridgeDaemon(
+          host,
+          port,
+          Boolean(opts.allowRemote),
+        );
+        for (let i = 0; i < 30; i++) {
+          if (await isBridgeAlive()) break;
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        if (!(await isBridgeAlive())) {
+          throw new Error("bridge 启动失败，请尝试：llms bridge serve");
+        }
+        console.log(`bridge 已启动 pid=${pid} ${bridgeRootUrl()}`);
+      },
+    );
 
   bridge
     .command("stop")
@@ -136,8 +149,9 @@ export function registerBridgeCommand(program: Command): void {
       if (!profile) {
         throw new Error(`没有可用的 ${tool} profile`);
       }
-      writeBridgeUpstream(tool, upstreamFromProfile(profile, tool));
-      const base = await ensureBridgeForProfile(profile, tool);
-      console.log(`已刷新 ${tool} 上游 ${profile.name} → bridge ${base}`);
+      const connection = await ensureBridgeForProfile(profile, tool);
+      console.log(
+        `已刷新 ${tool} 上游 ${profile.name} → bridge ${connection.baseUrl}`,
+      );
     });
 }

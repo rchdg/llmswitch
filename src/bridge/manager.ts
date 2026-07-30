@@ -1,40 +1,75 @@
-import { execFileSync, spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { Profile, Tool } from "../types.js";
 import { normalizeBaseUrlForFormat } from "../utils/base-url.js";
 import {
   bridgeBaseUrl,
   bridgeRootUrl,
-  getBridgePidPath,
+  generateBridgeToken,
   readBridgeState,
-  readBridgeUpstreams,
-  writeBridgeState,
+  updateBridgeState,
   writeBridgeUpstream,
 } from "./state.js";
 import {
   DEFAULT_BRIDGE_HOST,
   DEFAULT_BRIDGE_PORT,
-  emptyUpstreams,
   hasAnyUpstream,
+  type BridgeInstanceState,
+  type BridgeRuntimeState,
   type BridgeTool,
   type BridgeUpstream,
   type BridgeUpstreamMode,
 } from "./types.js";
+import {
+  assertBridgeListenerAllowed,
+  formatHostForUrl,
+  parseBridgePort,
+  resolveBridgeListener,
+} from "./runtime.js";
 import { listenBridge } from "./server.js";
+
+export class PortOccupiedError extends Error {
+  constructor(host: string, port: number) {
+    super(`端口 ${host}:${port} 已被其他进程占用；为避免误杀，llm-switch 不会自动终止该进程。`);
+    this.name = "PortOccupiedError";
+  }
+}
+
+export class LegacyBridgeRunningError extends Error {
+  constructor(host: string, port: number) {
+    super(
+      `检测到旧版 bridge 正在 ${host}:${port} 运行。请先执行 llms bridge stop --legacy 并确认风险，然后重试。`,
+    );
+    this.name = "LegacyBridgeRunningError";
+  }
+}
+
+export class BridgeControlError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BridgeControlError";
+  }
+}
+
+export interface BridgeConnection {
+  baseUrl: string;
+  clientToken: string;
+}
 
 export function profileNeedsBridge(profile: Profile): boolean {
   return profile.apiFormat === "openai-chat";
 }
 
 export function bridgeToolForCliTool(tool: Tool): BridgeTool | null {
-  if (tool === "codex" || tool === "claude") return tool;
-  return null;
+  return tool === "codex" || tool === "claude" ? tool : null;
 }
 
 export function upstreamFromProfile(
   profile: Profile,
   tool: BridgeTool,
+  clientToken: string | null = null,
 ): BridgeUpstream {
   const mode: BridgeUpstreamMode =
     tool === "claude" ? "chat" : profile.bridgeMode || "chat";
@@ -46,57 +81,89 @@ export function upstreamFromProfile(
     headers: profile.headers,
     profileName: profile.name,
     updatedAt: new Date().toISOString(),
+    clientToken,
+    migrationRequired: !clientToken,
   };
 }
 
 export type BridgeProbe = {
-  /** TCP/HTTP responded at all (including old incompatible bridge). */
   reachable: boolean;
-  /** Current bridge health payload with ok + upstreams. */
   healthy: boolean;
+  authenticated: boolean;
+  legacy: boolean;
+  instanceId?: string;
 };
 
-/**
- * Probe local bridge. Old builds may return 503 without `upstreams` — treat as
- * reachable but not healthy so callers can restart.
- */
+function controlUrl(host: string, port: number, path: string): string {
+  return `http://${formatHostForUrl(host)}:${port}${path}`;
+}
+
 export async function probeBridge(
-  host = readBridgeState().host,
-  port = readBridgeState().port,
+  host = readBridgeState().listener.advertiseHost,
+  port = readBridgeState().listener.port,
 ): Promise<BridgeProbe> {
+  const state = readBridgeState();
+  const expected = state.instance;
   try {
-    const res = await fetch(`http://${host}:${port}/health`, {
+    const headers: Record<string, string> = {};
+    if (expected?.controlToken) {
+      headers["x-llm-switch-control"] = expected.controlToken;
+    }
+    const response = await fetch(controlUrl(host, port, "/health"), {
+      headers,
       signal: AbortSignal.timeout(800),
     });
     let body: Record<string, unknown> | null = null;
     try {
-      body = (await res.json()) as Record<string, unknown>;
+      body = (await response.json()) as Record<string, unknown>;
     } catch {
       body = null;
     }
-    const healthy =
-      res.ok && body?.ok === true && body != null && "upstreams" in body;
-    return { reachable: true, healthy };
+    const instanceId =
+      typeof body?.instanceId === "string" ? body.instanceId : undefined;
+    const authenticated = Boolean(
+      response.ok &&
+        expected &&
+        instanceId &&
+        instanceId === expected.id,
+    );
+    const legacy = Boolean(
+      response.ok &&
+        body?.ok === true &&
+        body != null &&
+        "upstreams" in body &&
+        !("service" in body),
+    );
+    return {
+      reachable: true,
+      healthy: authenticated,
+      authenticated,
+      legacy,
+      instanceId,
+    };
   } catch {
-    return { reachable: false, healthy: false };
+    return {
+      reachable: false,
+      healthy: false,
+      authenticated: false,
+      legacy: false,
+    };
   }
 }
 
 export async function isBridgeAlive(
-  host = readBridgeState().host,
-  port = readBridgeState().port,
+  host = readBridgeState().listener.advertiseHost,
+  port = readBridgeState().listener.port,
 ): Promise<boolean> {
   return (await probeBridge(host, port)).healthy;
 }
 
 export function readPid(): number | null {
-  const path = getBridgePidPath();
-  if (!existsSync(path)) return null;
-  const n = Number(readFileSync(path, "utf8").trim());
-  return Number.isFinite(n) ? n : null;
+  return readBridgeState().instance?.pid ?? null;
 }
 
 export function isPidRunning(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid < 1 || pid > 2_147_483_647) return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -105,70 +172,73 @@ export function isPidRunning(pid: number): boolean {
   }
 }
 
-function urlForTool(
+function connectionForTool(
   tool: BridgeTool,
-  host: string,
-  port: number,
-  pid: number | null,
-): string {
-  const upstreams = readBridgeUpstreams();
-  const state = { host, port, upstreams, pid };
-  return tool === "claude" ? bridgeRootUrl(state) : bridgeBaseUrl(state);
+  state: BridgeRuntimeState,
+  clientToken: string,
+): BridgeConnection {
+  return {
+    baseUrl: tool === "claude" ? bridgeRootUrl(state) : bridgeBaseUrl(state),
+    clientToken,
+  };
+}
+
+function desiredListener(): ReturnType<typeof resolveBridgeListener> {
+  const current = readBridgeState();
+  const host = process.env.LLM_SWITCH_BRIDGE_HOST || current.listener.bindHost;
+  const port = process.env.LLM_SWITCH_BRIDGE_PORT
+    ? parseBridgePort(process.env.LLM_SWITCH_BRIDGE_PORT)
+    : current.listener.port;
+  const allowRemote = current.listener.allowRemote;
+  return resolveBridgeListener({ host, port, allowRemote });
 }
 
 /**
- * Configure per-tool upstream and ensure local bridge is listening.
- * Returns Codex base (`…/v1`) or Claude root (`…` without /v1).
+ * Preflight the listen address before writing an upstream, then configure the
+ * side and ensure an authenticated v2 daemon is running.
  */
 export async function ensureBridgeForProfile(
   profile: Profile,
   tool: BridgeTool,
-): Promise<string> {
-  const upstream = upstreamFromProfile(profile, tool);
-  writeBridgeUpstream(tool, upstream);
-
-  const state = readBridgeState();
-  const host = state.host || DEFAULT_BRIDGE_HOST;
-  const port =
-    Number(process.env.LLM_SWITCH_BRIDGE_PORT) ||
-    state.port ||
-    DEFAULT_BRIDGE_PORT;
-
-  const upstreams = readBridgeUpstreams();
-  writeBridgeState({
-    ...state,
-    host,
-    port,
-    upstreams,
-    pid: state.pid,
-  });
-
-  const probe = await probeBridge(host, port);
-  if (probe.healthy) {
-    return urlForTool(tool, host, port, state.pid);
-  }
-
-  // Stale / incompatible process holding the port (e.g. pre-dual-upstream build).
-  if (probe.reachable) {
-    await forceStopBridge(host, port);
-  }
-
-  await startBridgeDaemon(host, port);
-  for (let i = 0; i < 50; i++) {
-    if (await isBridgeAlive(host, port)) {
-      return urlForTool(tool, host, port, readPid());
+): Promise<BridgeConnection> {
+  const listener = desiredListener();
+  const before = await probeBridge(listener.advertiseHost, listener.port);
+  if (before.reachable && !before.healthy) {
+    if (before.legacy) {
+      throw new LegacyBridgeRunningError(listener.bindHost, listener.port);
     }
-    await new Promise((r) => setTimeout(r, 100));
+    throw new PortOccupiedError(listener.bindHost, listener.port);
   }
-  throw new Error(
-    `Bridge 启动超时（${host}:${port}）。可手动运行：llms bridge serve`,
-  );
+
+  const clientToken = generateBridgeToken();
+  const upstream = upstreamFromProfile(profile, tool, clientToken);
+  const configured = updateBridgeState((state) => ({
+    ...state,
+    listener,
+    host: listener.advertiseHost,
+    port: listener.port,
+    upstreams: { ...state.upstreams, [tool]: upstream },
+  }));
+
+  if (!before.healthy) {
+    await startBridgeDaemon(listener.bindHost, listener.port, listener.allowRemote);
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      if (await isBridgeAlive(listener.advertiseHost, listener.port)) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (!(await isBridgeAlive(listener.advertiseHost, listener.port))) {
+      throw new BridgeControlError(
+        `Bridge 启动超时（${listener.bindHost}:${listener.port}）。可手动运行：llms bridge serve`,
+      );
+    }
+  }
+  return connectionForTool(tool, readBridgeState() || configured, clientToken);
 }
 
 export async function clearBridgeUpstream(tool: BridgeTool): Promise<void> {
   writeBridgeUpstream(tool, null);
-  const upstreams = readBridgeUpstreams();
-  if (!hasAnyUpstream(upstreams)) {
+  const state = readBridgeState();
+  if (!hasAnyUpstream(state.upstreams) && state.instance) {
     await stopBridge();
   }
 }
@@ -176,142 +246,191 @@ export async function clearBridgeUpstream(tool: BridgeTool): Promise<void> {
 export async function startBridgeDaemon(
   host = DEFAULT_BRIDGE_HOST,
   port = DEFAULT_BRIDGE_PORT,
+  allowRemote = false,
 ): Promise<number> {
-  if (await isBridgeAlive(host, port)) {
-    return readPid() || 0;
+  const listener = resolveBridgeListener({ host, port, allowRemote });
+  const probe = await probeBridge(listener.advertiseHost, listener.port);
+  if (probe.healthy) return readPid() || 0;
+  if (probe.reachable) {
+    if (probe.legacy) throw new LegacyBridgeRunningError(host, port);
+    throw new PortOccupiedError(host, port);
   }
 
-  const probe = await probeBridge(host, port);
-  if (probe.reachable) {
-    await forceStopBridge(host, port);
-  }
+  updateBridgeState((state) => ({
+    ...state,
+    listener,
+    host: listener.advertiseHost,
+    port: listener.port,
+    instance: null,
+    pid: null,
+  }));
 
   const entry = resolveCliEntry();
-  const child = spawn(
-    process.execPath,
-    [entry, "bridge", "serve", "--host", host, "--port", String(port)],
-    {
-      detached: true,
-      stdio: "ignore",
-      env: {
-        ...process.env,
-        LLM_SWITCH_BRIDGE_PORT: String(port),
-        LLM_SWITCH_BRIDGE_HOST: host,
-      },
+  const args = [entry, "bridge", "serve", "--host", host, "--port", String(port)];
+  if (allowRemote) args.push("--allow-remote");
+  const child = spawn(process.execPath, args, {
+    detached: true,
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      LLM_SWITCH_BRIDGE_PORT: String(port),
+      LLM_SWITCH_BRIDGE_HOST: host,
     },
-  );
-  child.unref();
-  const pid = child.pid;
-  if (!pid) throw new Error("无法启动 bridge 进程");
-
-  const state = readBridgeState();
-  writeBridgeState({
-    ...state,
-    host,
-    port,
-    pid,
-    upstreams: state.upstreams,
   });
-  return pid;
-}
-
-/** Stop by recorded pid, then free the listen port if still held. */
-export async function forceStopBridge(
-  host = readBridgeState().host,
-  port = readBridgeState().port,
-): Promise<void> {
-  await stopBridge();
-  await killListenersOnPort(port);
-  // Brief wait so TIME_WAIT / bind release settles.
-  for (let i = 0; i < 20; i++) {
-    const probe = await probeBridge(host, port);
-    if (!probe.reachable) return;
-    await new Promise((r) => setTimeout(r, 50));
-  }
+  child.unref();
+  if (!child.pid) throw new BridgeControlError("无法启动 bridge 进程");
+  return child.pid;
 }
 
 export async function stopBridge(): Promise<boolean> {
   const state = readBridgeState();
-  const pid = state.pid || readPid();
-  let stopped = false;
-  if (pid && isPidRunning(pid)) {
-    try {
-      process.kill(pid, "SIGTERM");
-      stopped = true;
-    } catch {
-      // ignore
-    }
+  const instance = state.instance;
+  if (!instance) return false;
+  const probe = await probeBridge(
+    state.listener.advertiseHost,
+    state.listener.port,
+  );
+  if (!probe.authenticated || probe.instanceId !== instance.id) {
+    throw new BridgeControlError(
+      "无法验证 bridge 实例身份；为避免误杀，未发送任何进程信号。",
+    );
   }
-  writeBridgeState({
-    ...state,
-    pid: null,
-    upstreams: state.upstreams,
-  });
-  return stopped;
+  let response: Response;
+  try {
+    response = await fetch(
+      controlUrl(
+        state.listener.advertiseHost,
+        state.listener.port,
+        "/_control/shutdown",
+      ),
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-llm-switch-control": instance.controlToken,
+        },
+        body: JSON.stringify({ instanceId: instance.id }),
+        signal: AbortSignal.timeout(2_000),
+      },
+    );
+  } catch (error) {
+    throw new BridgeControlError(
+      `Bridge 协作关闭失败：${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (!response.ok) {
+    throw new BridgeControlError(`Bridge 拒绝关闭请求（HTTP ${response.status}）`);
+  }
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (readBridgeState().instance?.id !== instance.id) return true;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new BridgeControlError("Bridge 已接受关闭请求，但未在宽限期内清除实例身份");
 }
 
-function killListenersOnPort(port: number): void {
-  if (process.platform === "win32") return;
-  try {
-    const out = execFileSync(
-      "lsof",
-      ["-ti", `tcp:${port}`, `-sTCP:LISTEN`],
-      { encoding: "utf8" },
-    );
-    for (const line of out.split(/\n/)) {
-      const pid = Number(line.trim());
-      if (!pid || pid === process.pid) continue;
-      try {
-        process.kill(pid, "SIGTERM");
-      } catch {
-        // ignore
-      }
-    }
-  } catch {
-    // lsof miss / no listeners — ignore
-  }
+/** Compatibility alias: v2 never force-kills a listener. */
+export async function forceStopBridge(): Promise<void> {
+  await stopBridge();
 }
 
 export async function runBridgeForeground(
   host: string,
   port: number,
+  allowRemote = false,
 ): Promise<void> {
-  const state = readBridgeState();
-  writeBridgeState({
-    ...state,
-    host,
-    port,
+  assertBridgeListenerAllowed(host, allowRemote);
+  const listener = resolveBridgeListener({ host, port, allowRemote });
+  const previous = readBridgeState();
+  const instance: BridgeInstanceState = {
+    id: randomUUID(),
+    controlToken: generateBridgeToken(),
     pid: process.pid,
-    upstreams: state.upstreams.codex || state.upstreams.claude
-      ? state.upstreams
-      : readBridgeUpstreams() || emptyUpstreams(),
-  });
-
-  const server = await listenBridge(port, host);
-  const shutdown = () => {
-    server.close(() => process.exit(0));
+    startedAt: new Date().toISOString(),
   };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  updateBridgeState((state) => ({
+    ...state,
+    listener,
+    host: listener.advertiseHost,
+    port: listener.port,
+    pid: process.pid,
+    instance,
+  }));
 
+  let resolveClosed: (() => void) | undefined;
+  const closed = new Promise<void>((resolve) => {
+    resolveClosed = resolve;
+  });
+  let server: Awaited<ReturnType<typeof listenBridge>> | null = null;
+  let closing = false;
+
+  const clearIdentity = () => {
+    updateBridgeState((state) =>
+      state.instance?.id === instance.id
+        ? { ...state, instance: null, pid: null }
+        : state,
+    );
+  };
+
+  const shutdown = async (requestedId = instance.id): Promise<void> => {
+    if (requestedId !== instance.id || closing) return;
+    closing = true;
+    if (server) {
+      const forceTimer = setTimeout(() => server?.closeAllConnections(), 30_000);
+      await new Promise<void>((resolve) => server!.close(() => resolve()));
+      clearTimeout(forceTimer);
+    }
+    clearIdentity();
+    resolveClosed?.();
+  };
+
+  try {
+    server = await listenBridge(listener.port, listener.bindHost, {
+      controlToken: instance.controlToken,
+      instanceId: instance.id,
+      onShutdown: shutdown,
+    });
+  } catch (error) {
+    try {
+      clearIdentity();
+    } catch {
+      // Preserve the original bind error.
+    }
+    if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") {
+      throw new PortOccupiedError(listener.bindHost, listener.port);
+    }
+    // Restore the previous listener only when no newer instance replaced us.
+    updateBridgeState((state) =>
+      state.instance
+        ? state
+        : {
+            ...state,
+            listener: previous.listener,
+            host: previous.listener.advertiseHost,
+            port: previous.listener.port,
+          },
+    );
+    throw error;
+  }
+
+  const onSignal = () => {
+    void shutdown();
+  };
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
   console.error(
-    `llm-switch bridge listening on http://${host}:${port} (POST /v1/responses · POST /v1/messages → upstream chat/completions)`,
+    `llm-switch bridge listening on http://${formatHostForUrl(listener.bindHost)}:${listener.port} (authenticated)`,
   );
-  await new Promise(() => undefined);
+  await closed;
+  process.removeListener("SIGINT", onSignal);
+  process.removeListener("SIGTERM", onSignal);
 }
 
-/**
- * Prefer the entry currently running this CLI so `bun run ./src/index.ts`
- * respawns the same source tree; published installs use dist/index.js.
- */
 function resolveCliEntry(): string {
   const running = process.argv[1];
-  if (running && existsSync(running)) {
-    return running;
-  }
+  if (running && existsSync(running)) return running;
   const compiled = fileURLToPath(new URL("../index.js", import.meta.url));
   if (existsSync(compiled)) return compiled;
   const source = fileURLToPath(new URL("../index.ts", import.meta.url));
   if (existsSync(source)) return source;
-  throw new Error("无法定位 llmswitch 入口文件");
+  throw new BridgeControlError("无法定位 llmswitch 入口文件");
 }
