@@ -7,8 +7,8 @@ import {
 } from "../src/presets/index.js";
 
 describe("provider presets", () => {
-  test("only three presets exist", () => {
-    expect(PRESET_IDS).toEqual(["custom", "openai", "anthropic"]);
+  test("only four presets exist", () => {
+    expect(PRESET_IDS).toEqual(["custom", "openai", "anthropic", "ollama"]);
     expect(PRESETS.map((p) => p.id).sort()).toEqual(
       [...PRESET_IDS].sort(),
     );
@@ -18,15 +18,18 @@ describe("provider presets", () => {
     expect(presetsForTool("claude").map((p) => p.id)).toEqual([
       "custom",
       "anthropic",
+      "ollama",
     ]);
     expect(presetsForTool("codex").map((p) => p.id)).toEqual([
       "custom",
       "openai",
+      "ollama",
     ]);
     expect(presetsForTool("opencode").map((p) => p.id)).toEqual([
       "custom",
       "openai",
       "anthropic",
+      "ollama",
     ]);
   });
 
@@ -39,5 +42,7 @@ describe("provider presets", () => {
     expect(getPreset("anthropic")?.apiFormat).toBe("anthropic");
     expect(getPreset("custom")?.apiFormat).toBe("openai-chat");
     expect(getPreset("custom")?.baseUrl).toBe("");
+    expect(getPreset("ollama")?.baseUrl).toBe("http://localhost:11434");
+    expect(getPreset("ollama")?.apiFormat).toBe("openai-chat");
   });
 });

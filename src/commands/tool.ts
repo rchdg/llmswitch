@@ -11,12 +11,15 @@ import {
   listProfiles,
   publicProfileView,
   requireProfile,
+  resolveProfileOrThrow,
   saveProfile,
   setDefaultProfile,
 } from "../store/profiles.js";
 import { formatProxySummary } from "../utils/proxy.js";
+import { runToolFlow } from "./setup-cmd.js";
 import {
   exitOnCancel,
+  formatProfileListLabel,
   promptEditProfile,
   promptProfileDraft,
   resolveModelsInteractive,
@@ -27,6 +30,9 @@ export function registerToolCommand(program: Command, tool: Tool): void {
   const cmd = program
     .command(tool)
     .description(`管理 ${tool} 的供应商与模型配置`);
+
+  // llms <tool>（无子命令）：连贯启动，未配置时自动引导
+  cmd.action(() => runToolFlow(tool));
 
   cmd
     .command("provider")
@@ -61,7 +67,7 @@ export function registerToolCommand(program: Command, tool: Tool): void {
     .action(async (name?: string, opts?: { json?: boolean }) => {
       ensureDefaultProvider(tool);
       const profileName = await resolveProfileName(tool, name);
-      const profile = requireProfile(tool, profileName);
+      const profile = resolveProfileOrThrow(tool, profileName);
       const result = await applyProfile(tool, profile);
       if (opts?.json) {
         console.log(JSON.stringify(result, null, 2));
@@ -140,7 +146,7 @@ async function runProviderManager(tool: Tool): Promise<void> {
         ...profiles.map((profile) => ({
           value: profile.name,
           // hint 仅高亮时可见，状态标在 label 上便于扫一眼认出默认项
-          label: formatProviderListLabel(profile, {
+          label: formatProfileListLabel(profile, {
             defaultName,
             activeName: active,
           }),
@@ -161,7 +167,9 @@ async function runProviderManager(tool: Tool): Promise<void> {
 
     if (selected === "__new__") {
       await handleProviderAdd(tool);
-      continue;
+      // 添加完成后直接结束，不再返回供应商列表
+      p.outro("添加完成");
+      return;
     }
 
     await handleProviderActions(tool, selected);
@@ -171,20 +179,13 @@ async function runProviderManager(tool: Tool): Promise<void> {
 async function handleProviderAdd(tool: Tool): Promise<void> {
   const created = await promptProfileDraft(tool);
   ensureDefaultProvider(tool);
-  const enable = await p.confirm({
-    message: `是否立即启用「${created.name}」？`,
-    initialValue: true,
-  });
-  if (p.isCancel(enable)) {
-    p.cancel("已取消");
-    process.exit(0);
-  }
-  if (enable) {
-    const result = await applyProfile(tool, created);
-    p.log.success(`已启用 ${tool}/${created.name}`);
-    p.log.info(`配置文件：${result.configPath}`);
-    p.log.info(result.restartHint);
-  }
+  // 静默启用：不再询问，用户可在 provider 菜单中关闭
+  const result = await applyProfile(tool, created);
+  p.log.success(
+    `已启用 ${tool}/${created.name}（${created.displayName || created.name}）`,
+  );
+  p.log.info(`配置文件：${result.configPath}`);
+  p.log.info(result.restartHint);
 }
 
 async function handleProviderActions(
@@ -391,8 +392,7 @@ async function resolveProfileName(
   name?: string,
 ): Promise<string> {
   if (name) {
-    requireProfile(tool, name);
-    return name;
+    return resolveProfileOrThrow(tool, name).name;
   }
 
   ensureDefaultProvider(tool);
@@ -407,7 +407,7 @@ async function resolveProfileName(
     message: `选择 ${tool} 供应商`,
     options: profiles.map((profile) => ({
       value: profile.name,
-      label: formatProviderListLabel(profile, {
+      label: formatProfileListLabel(profile, {
         defaultName,
         activeName: active,
       }),
@@ -417,21 +417,6 @@ async function resolveProfileName(
   });
   exitOnCancel(selected);
   return selected;
-}
-
-/** 列表项 label 始终可见；hint 仅在高亮行显示。 */
-function formatProviderListLabel(
-  profile: Profile,
-  opts: {
-    defaultName: string | null | undefined;
-    activeName: string | null | undefined;
-  },
-): string {
-  const name = profile.displayName || profile.name;
-  const tags: string[] = [];
-  if (profile.name === opts.defaultName) tags.push("默认");
-  if (profile.name === opts.activeName) tags.push("已启用");
-  return tags.length ? `${name}（${tags.join(" · ")}）` : name;
 }
 
 function registerModelCommands(parent: Command, tool: Tool): void {
@@ -444,7 +429,7 @@ function registerModelCommands(parent: Command, tool: Tool): void {
       p.intro(`配置 ${tool} 模型`);
 
       const profile = opts.profile
-        ? requireProfile(tool, opts.profile)
+        ? resolveProfileOrThrow(tool, opts.profile)
         : requireProfile(tool, await resolveProfileName(tool));
 
       await configureProfileModels(tool, profile);

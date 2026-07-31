@@ -3,7 +3,10 @@ import { TOOLS } from "./types.js";
 import { registerToolCommand } from "./commands/tool.js";
 import { registerLaunchCommand } from "./commands/launch-cmd.js";
 import { registerBridgeCommand } from "./commands/bridge-cmd.js";
+import { registerSetupCommand } from "./commands/setup-cmd.js";
+import { registerHomeCommand } from "./commands/home-cmd.js";
 import { getAppConfigRoot } from "./utils/paths.js";
+import { getVersion } from "./utils/version.js";
 
 export function createProgram(): Command {
   const program = new Command();
@@ -13,7 +16,7 @@ export function createProgram(): Command {
     .description(
       "为 Claude Code / Codex / OpenCode 切换供应商、模型与上游代理",
     )
-    .version("0.2.0")
+    .version(getVersion())
     .option("--json", "部分命令支持 JSON 输出（见子命令）");
 
   program
@@ -25,14 +28,22 @@ export function createProgram(): Command {
 
   registerLaunchCommand(program);
   registerBridgeCommand(program);
+  registerSetupCommand(program);
 
   for (const tool of TOOLS) {
     registerToolCommand(program, tool);
   }
 
+  registerHomeCommand(program);
+
   program.configureOutput({
     writeErr: (str) => process.stderr.write(str),
   });
+
+  program.addHelpText(
+    "afterAll",
+    "\n反馈与建议：rchdg50@gmail.com\nGitHub Issues：https://github.com/rchdg/llmswitch/issues\n",
+  );
 
   return program;
 }

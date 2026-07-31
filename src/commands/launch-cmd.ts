@@ -1,10 +1,13 @@
 import { Command } from "commander";
+import * as p from "@clack/prompts";
 import { isTool, TOOLS } from "../types.js";
+import { listProfiles } from "../store/profiles.js";
 import {
   launchTool,
   resolveBinary,
   resolveLaunchTarget,
 } from "./launch.js";
+import { runSetupWizard } from "./setup-cmd.js";
 
 /**
  * ollama-like quick start:
@@ -49,6 +52,24 @@ export function registerLaunchCommand(program: Command): void {
           throw new Error(
             `未知工具「${toolArg}」。可选：${TOOLS.join(", ")}`,
           );
+        }
+
+        if (
+          listProfiles(toolArg).length === 0 &&
+          process.stdin.isTTY &&
+          !opts.dryRun
+        ) {
+          const setup = await p.confirm({
+            message: `${toolArg} 尚未配置供应商，是否进入引导？`,
+            initialValue: true,
+          });
+          if (p.isCancel(setup)) {
+            p.cancel("已取消");
+            process.exit(0);
+          }
+          if (setup) {
+            await runSetupWizard(toolArg);
+          }
         }
 
         let model = opts.model?.trim() || undefined;

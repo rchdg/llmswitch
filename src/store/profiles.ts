@@ -84,6 +84,54 @@ export function requireProfile(tool: Tool, name: string): Profile {
   return profile;
 }
 
+/** 归一化引用串：小写并去掉分隔符（kimi-openai ↔ kimiOpenai）。 */
+export function normalizeReference(value: string): string {
+  return value.toLowerCase().replace(/[_\s./-]+/g, "");
+}
+
+/**
+ * 按用户输入解析 profile：优先名称精确匹配，其次显示名称精确匹配，
+ * 再尝试归一化（大小写/分隔符）与包含匹配；多义时返回 null。
+ */
+export function resolveProfile(tool: Tool, query: string): Profile | null {
+  const trimmed = query.trim();
+  if (!trimmed) return null;
+  const byName = readProfile(tool, trimmed);
+  if (byName) return byName;
+
+  const profiles = listProfiles(tool);
+  const normalized = normalizeReference(trimmed);
+
+  const exactDisplay = profiles.find(
+    (p) => normalizeReference(p.displayName) === normalized,
+  );
+  if (exactDisplay) return exactDisplay;
+
+  const fuzzy = profiles.filter(
+    (p) =>
+      normalizeReference(p.displayName).includes(normalized) ||
+      normalizeReference(p.name).includes(normalized),
+  );
+  return fuzzy.length === 1 ? fuzzy[0]! : null;
+}
+
+export function resolveProfileOrThrow(tool: Tool, query: string): Profile {
+  const profile = resolveProfile(tool, query);
+  if (!profile) {
+    const profiles = listProfiles(tool);
+    if (profiles.length === 0) {
+      throw new Error(`暂无 ${tool} 供应商。请先：llms ${tool} provider`);
+    }
+    const names = profiles
+      .map((p) => `${p.name}（${p.displayName}）`)
+      .join(", ");
+    throw new Error(
+      `未找到匹配「${query}」的供应商。现有：${names}。可通过名称或显示名称引用。`,
+    );
+  }
+  return profile;
+}
+
 export function saveProfile(tool: Tool, profile: Profile): void {
   assertValidProfileName(profile.name);
   if (!isApiFormat(profile.apiFormat)) {

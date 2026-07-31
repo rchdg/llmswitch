@@ -9,6 +9,7 @@ import {
   getDefaultProfile,
   listProfiles,
   requireProfile,
+  resolveProfileOrThrow,
   saveProfile,
   ensureDefaultProvider,
 } from "../store/profiles.js";
@@ -125,7 +126,7 @@ export function resolveLaunchTarget(
   let profile: Profile | null = null;
 
   if (opts.profile) {
-    profile = requireProfile(tool, opts.profile);
+    profile = resolveProfileOrThrow(tool, opts.profile);
   }
 
   if (!profile && modelQuery) {

@@ -1,7 +1,7 @@
 import type { ApiFormat, Tool } from "../types.js";
 import { supportedFormats } from "../formats/compatibility.js";
 
-export const PRESET_IDS = ["custom", "openai", "anthropic"] as const;
+export const PRESET_IDS = ["custom", "openai", "anthropic", "ollama"] as const;
 export type PresetId = (typeof PRESET_IDS)[number];
 
 export interface PresetTemplate {
@@ -41,6 +41,15 @@ export const PRESETS: PresetTemplate[] = [
     defaultModel: "",
     models: [],
     tools: ["claude", "opencode"],
+  },
+  {
+    id: "ollama",
+    displayName: "Ollama（本地）",
+    apiFormat: "openai-chat",
+    baseUrl: "http://localhost:11434",
+    defaultModel: "",
+    models: [],
+    tools: ["claude", "codex", "opencode"],
   },
 ];
 

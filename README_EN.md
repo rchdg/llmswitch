@@ -1,49 +1,16 @@
 <p align="center">
-  <img src="./assets/readme/hero.svg" width="100%" alt="llmswitch: switch providers and models for Claude Code, Codex, and OpenCode, with API translation when needed">
+  <img src="./assets/readme/hero.svg" width="100%" alt="llmswitch: switch providers and models for Claude Code, Codex, and OpenCode">
 </p>
 
 <p align="center">
-  <strong>Manage providers, models, proxies, and launch workflows for Claude Code, Codex, and OpenCode with one CLI.</strong>
+  <strong>One CLI to manage model switching for Claude Code, Codex, and OpenCode.</strong>
 </p>
 
 <p align="center">
   <a href="./README.md">简体中文</a> · <strong>English</strong>
 </p>
 
-<p align="center">
-  <a href="#quick-start">Quick Start</a> ·
-  <a href="#compatibility">Compatibility</a> ·
-  <a href="#command-reference">Command Reference</a> ·
-  <a href="#configuration-and-security">Configuration & Security</a> ·
-  <a href="./LICENSE">MIT License</a>
-</p>
-
-## What is llmswitch?
-
-`llmswitch` is a local command-line tool for **Claude Code, Codex, and OpenCode**. It uses separate profiles to manage each tool's API endpoint, key, models, and proxy settings, then merges the selected profile into the tool's native configuration.
-
-Native protocols connect directly. When Claude Code or Codex needs to access an upstream service that only supports OpenAI Chat Completions, `llmswitch` automatically starts a loopback-only bridge that translates common requests, responses, and SSE events.
-
-```text
-                            ┌─ Claude Code ── Anthropic Messages
-provider profiles ─ llms ──┼─ Codex ──────── OpenAI Responses
-                            └─ OpenCode ────── native providers
-                                  │
-                     local bridge when protocols differ
-                                  │
-                            OpenAI Chat API
-```
-
-## Features
-
-- **One interface for three tools**: Manage Claude Code, Codex, and OpenCode through a consistent command structure.
-- **Isolated configurations**: Each tool keeps its own profiles, default profile, and active profile, preventing provider settings from being mixed.
-- **Switch and launch in one command**: Select a profile and model, update the configuration, and start the target CLI.
-- **On-demand protocol translation**: Translate common text, tool call, tool result, and streaming events between Messages / Responses and Chat Completions.
-- **Preserve existing configuration**: Merge only managed fields and create timestamped backups before changing existing target files.
-- **Model discovery**: Attempt to retrieve models from the upstream `/models` endpoint, with manual model entry as a fallback.
-- **Per-profile upstream proxies**: Configure HTTP, HTTPS, or ALL proxy settings independently for each profile.
-- **Script-friendly output**: Query, switch, launch-plan, and bridge-status commands support JSON output.
+---
 
 ## Quick Start
 
@@ -57,91 +24,175 @@ npm install -g @nvae/llmswitch
 bun add -g @nvae/llmswitch
 ```
 
-After installation, use the `llms` (or `llm-switch`) command. For local development:
+After installation, use the `llms` command (or `llm-switch` / `llmswitch`). Running `llms` with no arguments picks a tool and launches it; `llms <tool>` works the same way.
+
+### 0. One-Command Launch (Continuous Flow)
 
 ```bash
-bun run src/index.ts --help
+# Pick a tool and launch; if no provider is configured, it guides you through: add provider → pick models → enable → launch
+llms
+
+# Launch Codex directly (equivalent to llms launch codex)
+llms codex
 ```
 
-### 1. Add a provider
+`llms <tool>` adapts based on state:
 
-Create profiles independently for the tools you use:
+- Provider configured → launch directly (uses the currently enabled / default provider and its default model)
+- Not configured → automatically guides through adding a provider, picking models, silently enables it, then launches
+
+### 1. Explicit Guided Setup
 
 ```bash
+llms setup
+```
+
+The wizard guides you through: pick a tool → add a provider (API URL, key) → pick models → enable → launch. Installed tools are detected automatically; if only one is installed, it is selected for you.
+
+```bash
+# Skip tool selection, guide for Codex directly
+llms setup --tool codex
+```
+
+### 2. Add Provider Configuration
+```bash
+# Add configuration for Claude Code
 llms claude provider
+
+# Add configuration for Codex
 llms codex provider
+
+# Add configuration for OpenCode
 llms opencode provider
 ```
 
-The interactive interface lets you add, inspect, edit, delete, set as default, enable, and disable profiles. You can start from these templates:
+Follow the prompts to enter: API URL, API Key, display name.
 
-| Template | Default API format | Default Base URL |
-| --- | --- | --- |
-| Custom (OpenAI-compatible) | Chat Completions | Enter manually |
-| OpenAI | Responses | `https://api.openai.com/v1` |
-| Anthropic | Messages | `https://api.anthropic.com` |
+For custom upstreams, the API type (Anthropic / OpenAI Chat / OpenAI Responses) is auto-detected by probing the endpoint — no manual selection needed. Manual selection only appears when detection fails. Local Ollama is supported too (`/v1` compatible or native `/api/tags`, no API key required), and an "Ollama (local)" preset is available.
 
-Other providers can be connected through a compatible OpenAI or Anthropic API endpoint. This does not mean that every provider, field, or protocol extension is fully supported.
-
-### 2. Select models
+Profile names are auto-generated (5 random lowercase letters/digits, e.g. `69pjb`). Every command accepts either the name or the display name to reference a provider:
 
 ```bash
+# Both name and display name work
+llms codex use 69pjb
+llms codex use DeepSeek
+llms launch codex --profile deepseek   # normalized fuzzy match (case/separators ignored)
+```
+
+### 3. Select Models
+
+```bash
+# Select models for current tool
 llms codex model
-# Select models for a specific profile
+
+# Select models for a specific configuration
 llms codex model --profile my-provider
 ```
 
-When an API key is available, `llmswitch` attempts to retrieve the upstream model list. Use Space to select multiple models and Enter to confirm, then choose the default model. If the request fails or the upstream does not expose a compatible model endpoint, enter model IDs manually.
+With an API key, it automatically fetches the upstream model list. You can also manually enter model IDs.
 
-### 3. Enable a profile
+### 4. Enable Configuration
 
 ```bash
 llms codex use my-provider
+
+# View current configuration status
 llms codex current
 ```
 
-`use` backs up the current target configuration, merges the new provider settings, and records the profile as active.
-
-### 4. Switch models and launch
+### 5. Launch Tool
 
 ```bash
+# Launch Codex with specified model
 llms launch codex gpt-4.1
 
-# Equivalent form
-llms launch codex --model gpt-4.1
+# Launch Claude Code
+llms launch claude --model claude-sonnet-4-20250514
 
-# Select a profile explicitly
-llms launch claude --profile my-provider --model claude-sonnet-4
-
-# run is an alias for launch
+# Launch OpenCode
 llms run opencode my-model
+
+# Launch with specific configuration
+llms launch claude --profile my-provider --model claude-sonnet-4
 ```
 
-When `--profile` is omitted, profiles are selected in this order:
+When `--profile` is not specified, it automatically selects the configuration that contains the target model.
 
-1. A profile whose model list contains the requested model;
-2. The currently active profile;
-3. The default profile.
-
-Model matching ignores letter case and common separators. For example, `gpt4.1` can match `gpt-4.1`. If the requested model is not already in the profile, it is added to the model list and set as that profile's default model.
-
-### 5. Preview or update configuration only
+### 6. Preview Execution Plan
 
 ```bash
-# Show the plan without changing configuration or launching the CLI
+# View plan without actually launching
 llms launch codex gpt-4.1 --dry-run
 
-# Print the plan as JSON
+# Output as JSON
 llms launch codex gpt-4.1 --dry-run --json
-
-# Update configuration without launching the target CLI
-llms launch opencode my-model --print-only
-
-# Pass additional arguments to the target CLI
-llms launch opencode my-model -- --resume
 ```
 
-If a target CLI is not on `PATH`, specify its executable:
+### 7. Manage Local Bridge
+
+When Claude Code or Codex uses a non-native protocol, a local Bridge starts automatically.
+
+```bash
+# View Bridge status
+llms bridge status
+
+# Start/stop manually
+llms bridge start
+llms bridge stop
+
+# Reload configuration
+llms bridge reload claude
+llms bridge reload codex --profile my-provider
+```
+
+---
+
+## Common Commands
+
+| Command | Description |
+| --- | --- |
+| `llms` | Pick a tool and launch (auto-guides when not configured) |
+| `llms <tool>` | Launch the tool directly (auto-guides through full flow when not configured) |
+| `llms setup [--tool <tool>]` | Explicit guided setup (provider → models → enable → launch) |
+| `llms <tool> provider` | Manage provider configurations (add, view, edit, delete) |
+| `llms <tool> use [name]` | Enable specified configuration |
+| `llms <tool> current` | View current configuration |
+| `llms <tool> model` | Select models |
+| `llms launch/run <tool> [model]` | Launch tool |
+| `llms bridge status` | View Bridge status |
+| `llms path` | View data directory |
+
+`<tool>` can be `claude`, `codex`, or `opencode`.
+
+View full help:
+
+```bash
+llms --help
+llms launch --help
+```
+
+---
+
+## Configuration Locations
+
+| Data | Location |
+| --- | --- |
+| llmswitch config | `~/.config/llm-switch/` |
+| Claude Code | `~/.claude/settings.json` |
+| Codex | `~/.codex/config.toml` |
+| OpenCode | `~/.config/opencode/opencode.json` |
+
+View actual path:
+
+```bash
+llms path
+```
+
+---
+
+## Specify Executable Path
+
+If the tool is not in `PATH`, specify via environment variables:
 
 ```bash
 export CLAUDE_BIN=/path/to/claude
@@ -149,155 +200,17 @@ export CODEX_BIN=/path/to/codex
 export OPENCODE_BIN=/path/to/opencode
 ```
 
-## Compatibility
+---
 
-| Target tool | Anthropic Messages | OpenAI Chat Completions | OpenAI Responses |
-| --- | :---: | :---: | :---: |
-| Claude Code | Direct | Via bridge | Unsupported |
-| Codex | Unsupported | Via bridge | Direct |
-| OpenCode | Direct | Direct | Direct |
+## Feedback
 
-OpenCode uses the corresponding AI SDK provider for each API format:
+Found an issue or have a suggestion? Feel free to reach out:
 
-- Anthropic: `@ai-sdk/anthropic`
-- OpenAI Responses: `@ai-sdk/openai`
-- OpenAI Chat: `@ai-sdk/openai-compatible`
+- Email: rchdg50@gmail.com
+- GitHub Issues: https://github.com/rchdg/llmswitch/issues
 
-OpenAI-format Base URLs are normalized to end with exactly one `/v1`. Anthropic-format URLs only have trailing slashes removed. A custom gateway that does not use a `/v1` path may not work with the current OpenAI-format profiles.
-
-## Local Bridge
-
-Claude Code and Codex share one bridge process, but their upstream configurations remain isolated and may point to different providers. The bridge listens on `127.0.0.1:17890` by default:
-
-```text
-Claude Code  POST /v1/messages  ─┐
-                                 ├─ local bridge ─→ POST /v1/chat/completions
-Codex        POST /v1/responses ─┘
-```
-
-The bridge starts automatically when a profile requires it. Switching back to a native format removes that tool's bridge upstream. The process stops when neither tool requires the bridge.
-
-Common management commands:
-
-```bash
-llms bridge status
-llms bridge status --json
-llms bridge start
-llms bridge stop
-llms bridge reload claude
-llms bridge reload codex --profile my-provider
-
-# Run in the foreground for troubleshooting
-llms bridge serve
-```
-
-The bridge exposes these local endpoints:
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/health`, `/v1/health` | Inspect the service and upstream status |
-| `GET` | `/models`, `/v1/models` | Merge model lists from configured upstreams |
-| `POST` | `/messages`, `/v1/messages` | Anthropic Messages → Chat |
-| `POST` | `/responses`, `/v1/responses` | OpenAI Responses → Chat/Completions |
-
-```bash
-curl http://127.0.0.1:17890/health
-```
-
-> [!WARNING]
-> The bridge does not provide authentication, rate limiting, or request-body size limits. Keep the default loopback binding and do not use it as a public or multi-tenant production gateway.
-
-## Upstream Proxies
-
-When adding or editing a profile, you can configure:
-
-- `HTTP_PROXY`
-- `HTTPS_PROXY`
-- `ALL_PROXY`, for example `socks5h://127.0.0.1:1080`
-
-```bash
-llms claude provider
-# Choose Add or Edit, then enter the proxy settings
-```
-
-Native profiles merge the applicable proxy variables into the target tool's configuration. For bridge profiles, the bridge uses the proxy settings associated with the corresponding upstream. Actual behavior depends on the target CLI, the Node.js networking environment, and the proxy protocol, so verify it in your deployment environment.
-
-## Command Reference
-
-The common form is `llms <tool> <action>`, where `<tool>` is `claude`, `codex`, or `opencode`.
-
-| Command | Description |
-| --- | --- |
-| `llms <tool> provider` | Interactively manage profiles; use `--json` to list them |
-| `llms <tool> use [name]` | Enable an existing profile; supports `--json` |
-| `llms <tool> current` | Show the default and active profiles; API keys are masked |
-| `llms <tool> model [--profile name]` | Retrieve, select, and save models; supports `--json` |
-| `llms launch\|run <tool> [model]` | Switch profile/model and launch the target CLI |
-| `llms bridge status` | Show the bridge process and both upstream states |
-| `llms bridge start\|stop` | Start or stop the bridge manually |
-| `llms bridge reload [tool]` | Refresh one bridge upstream from the active or selected profile |
-| `llms bridge serve` | Run the bridge in the foreground |
-| `llms path` | Print the llmswitch data directory |
-
-View all options:
-
-```bash
-llms --help
-llms launch --help
-llms bridge --help
-llms codex --help
-```
-
-## Configuration and Security
-
-### Configuration locations
-
-| Data | Default location | Override |
-| --- | --- | --- |
-| llmswitch (macOS/Linux) | `~/.config/llm-switch/` | `LLM_SWITCH_HOME` or `XDG_CONFIG_HOME` |
-| llmswitch (Windows) | `%APPDATA%\llm-switch\` | `LLM_SWITCH_HOME` |
-| Claude Code | `~/.claude/settings.json` | `CLAUDE_CONFIG_DIR` |
-| Codex | `~/.codex/config.toml`, `~/.codex/.env` | `CODEX_HOME` |
-| OpenCode configuration | `~/.config/opencode/opencode.json` | `OPENCODE_CONFIG_DIR` or `XDG_CONFIG_HOME` |
-| OpenCode authentication | `~/.local/share/opencode/auth.json` | `OPENCODE_DATA_DIR` or `XDG_DATA_HOME` |
-
-For compatibility with the current application and existing configurations, the default llmswitch data path still uses the `llm-switch` directory name. On Windows, OpenCode authentication defaults to `%LOCALAPPDATA%\opencode\auth.json`. Print the active data directory with:
-
-```bash
-llms path
-```
-
-### Backup strategy
-
-Before changing or disabling a configuration, existing target files are copied into the corresponding tool's `backups/` directory with timestamped filenames. A newly created file has no previous content to back up. Writes use a temporary file in the same directory followed by a rename, reducing the chance of leaving a partially written configuration.
-
-### API keys
-
-API keys are stored in **plaintext** in local profiles, target-tool authentication files, or bridge upstream configuration. llmswitch attempts to set newly written files to mode `0600`, but it does not use the operating system keychain or encrypt secrets.
-
-Protect the configuration directories, never commit their contents to version control, and avoid storing long-lived keys on untrusted devices. JSON query output masks API keys, but files on disk still contain the actual values.
-
-## Known Limitations
-
-- The bridge is a protocol adapter for local use and does not guarantee complete semantic equivalence between the OpenAI and Anthropic protocols.
-- Encrypted reasoning content in Responses is not forwarded, and unrecognized tool types may be ignored.
-- Anthropic translation primarily covers text, tool calls, and tool results. Images and other non-text content may not be preserved completely.
-- Codex Completions mode is a degraded fallback: the conversation is flattened into a prompt, so complex tool calls and agent workflows may not behave well.
-- Codex Chat mode falls back to Completions only when the upstream returns HTTP `404` or `405`. Authentication, network, and other errors do not trigger fallback.
-- Hosted `web_search` requests are translated into ordinary Chat functions. If the upstream performs the search itself and returns a complete `<web_search>...</web_search>` block, the bridge restores it as a Responses `web_search_call` and preserves the result text without the tags.
-- Automatic model discovery requires an API key and a compatible `/models` endpoint. Enter model IDs manually when discovery fails.
-
-## Contributing
-
-Issues and pull requests that improve configuration adapters, protocol translation, tests, or documentation are welcome.
-
-When contributing a new provider or protocol adaptation, please include:
-
-- The target tool and API format;
-- Reproducible request and response behavior;
-- Tests for both regular and streaming responses;
-- Edge cases such as tool calls, tool results, and error responses.
+---
 
 ## License
 
-This project is available under the [MIT License](./LICENSE).
+MIT License - see [LICENSE](./LICENSE)

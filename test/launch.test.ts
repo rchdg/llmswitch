@@ -3,7 +3,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Profile } from "../src/types.ts";
-import { saveProfile, setActiveProfile } from "../src/store/profiles.ts";
+import {
+  resolveProfile,
+  saveProfile,
+  setActiveProfile,
+} from "../src/store/profiles.ts";
 import {
   findProfileForModel,
   matchModel,
@@ -76,5 +80,37 @@ describe("resolveLaunchTarget", () => {
       profile("b", ["glm-5.2"]),
     ];
     expect(findProfileForModel(list, "glm5.2")?.name).toBe("b");
+  });
+});
+
+describe("resolveProfile", () => {
+  test("exact name match", () => {
+    saveProfile("codex", profile("ab12c", ["m"], { displayName: "DeepSeek" }));
+    expect(resolveProfile("codex", "ab12c")?.name).toBe("ab12c");
+  });
+
+  test("display name exact match", () => {
+    saveProfile("codex", profile("ab12c", ["m"], { displayName: "DeepSeek" }));
+    expect(resolveProfile("codex", "DeepSeek")?.name).toBe("ab12c");
+  });
+
+  test("display name normalized match (case/separators)", () => {
+    saveProfile(
+      "codex",
+      profile("ab12c", ["m"], { displayName: "Kimi OpenAI" }),
+    );
+    expect(resolveProfile("codex", "kimi-openai")?.name).toBe("ab12c");
+    expect(resolveProfile("codex", "KIMI openai")?.name).toBe("ab12c");
+  });
+
+  test("partial display name resolves only when unambiguous", () => {
+    saveProfile("codex", profile("a1", ["m"], { displayName: "DeepSeek" }));
+    saveProfile("codex", profile("b2", ["m"], { displayName: "DeepThought" }));
+    expect(resolveProfile("codex", "deep")).toBeNull();
+  });
+
+  test("returns null when unknown", () => {
+    saveProfile("codex", profile("a1", ["m"], { displayName: "DeepSeek" }));
+    expect(resolveProfile("codex", "nope")).toBeNull();
   });
 });

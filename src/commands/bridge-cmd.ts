@@ -15,7 +15,7 @@ import {
 } from "../bridge/state.js";
 import { parseBridgePort } from "../bridge/runtime.js";
 import { DEFAULT_BRIDGE_HOST, DEFAULT_BRIDGE_PORT } from "../bridge/types.js";
-import { getActiveProfile, requireProfile } from "../store/profiles.js";
+import { getActiveProfile, resolveProfileOrThrow } from "../store/profiles.js";
 import { isTool } from "../types.js";
 
 export function registerBridgeCommand(program: Command): void {
@@ -144,7 +144,7 @@ export function registerBridgeCommand(program: Command): void {
       }
       const tool = toolName as "claude" | "codex";
       const profile = opts.profile
-        ? requireProfile(tool, opts.profile)
+        ? resolveProfileOrThrow(tool, opts.profile)
         : getActiveProfile(tool);
       if (!profile) {
         throw new Error(`没有可用的 ${tool} profile`);

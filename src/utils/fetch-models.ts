@@ -143,12 +143,17 @@ export async function fetchModelList(
   if (!baseUrl?.trim()) {
     throw new Error("Base URL 为空，无法拉取模型列表");
   }
-  if (!apiKey?.trim()) {
-    throw new Error("API Key 为空，无法拉取模型列表");
-  }
 
   const effectiveBaseUrl = normalizeBaseUrlForFormat(apiFormat, baseUrl);
   const endpoints = modelListEndpoints(effectiveBaseUrl);
+  // 无 Key 的本地服务（如 Ollama 原生 API）兜底探测 /api/tags
+  if (!apiKey?.trim()) {
+    const root = effectiveBaseUrl
+      .replace(/\/v1$/i, "")
+      .replace(/\/+$/, "");
+    const tags = `${root}/api/tags`;
+    if (!endpoints.includes(tags)) endpoints.push(tags);
+  }
   const headers = buildModelsRequestHeaders(
     apiFormat,
     apiKey.trim(),

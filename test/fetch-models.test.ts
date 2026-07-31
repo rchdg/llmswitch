@@ -130,6 +130,35 @@ describe("fetchModelList transport integration", () => {
     }
   });
 
+  test("keyless fetch falls back to ollama /api/tags", async () => {
+    const { createServer } = await import("node:http");
+    const server = createServer((req, res) => {
+      res.setHeader("Content-Type", "application/json");
+      if (req.url === "/api/tags") {
+        res.end(JSON.stringify({ models: [{ name: "llama3.2:3b" }] }));
+        return;
+      }
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: "not found" }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing port");
+    try {
+      const { fetchModelList } = await import("../src/utils/fetch-models.ts");
+      const result = await fetchModelList({
+        baseUrl: `http://127.0.0.1:${address.port}`,
+        apiKey: "",
+        apiFormat: "openai-chat",
+      });
+      expect(result.models).toEqual(["llama3.2:3b"]);
+      expect(result.endpoint).toBe(`http://127.0.0.1:${address.port}/api/tags`);
+      expect(result.resolvedBaseUrl).toBe(`http://127.0.0.1:${address.port}/v1`);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   test("does not infer an Anthropic Messages base from a sibling models URL", async () => {
     const { createServer } = await import("node:http");
     const server = createServer((req, res) => {

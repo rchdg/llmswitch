@@ -4,8 +4,10 @@ import { normalizeProxyValue } from "../types.js";
 import { isApiFormat } from "../types.js";
 import { formatLabel, supportedFormats } from "../formats/compatibility.js";
 import { getPreset, presetsForTool } from "../presets/index.js";
+import { detectApiFormat } from "../utils/detect-format.js";
 import {
   assertValidProfileName,
+  listProfiles,
   profileExists,
   saveProfile,
 } from "../store/profiles.js";
@@ -221,6 +223,53 @@ async function promptEditUpstream(
   return { apiFormat: picked as ApiFormat };
 }
 
+const NAME_GEN_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789";
+
+/**
+ * 生成 5 位小写字母与数字的随机 profile 名称，并确保不与现有名称冲突。
+ */
+export function generateProfileName(tool: Tool): string {
+  for (let attempt = 0; attempt < 32; attempt++) {
+    let name = "";
+    for (let i = 0; i < 5; i++) {
+      name += NAME_GEN_CHARS[Math.floor(Math.random() * NAME_GEN_CHARS.length)];
+    }
+    if (!profileExists(tool, name)) return name;
+  }
+  return `p${Date.now().toString(36).slice(-4)}`;
+}
+
+/**
+ * 显示名称默认值：基于现有 provider-N 递增（provider-1、provider-2 …）。
+ */
+export function suggestDisplayName(tool: Tool): string {
+  let max = 0;
+  for (const profile of listProfiles(tool)) {
+    const match = /^provider-(\d+)$/i.exec(profile.displayName);
+    if (match) max = Math.max(max, Number(match[1]));
+  }
+  return `provider-${max + 1}`;
+}
+
+/**
+ * 供应商列表 label：显示名称 +（profile 名称 · 状态标记）。
+ * 例：DeepSeek（6ham6 · 已启用）；显示名与名称相同时省略名称。
+ */
+export function formatProfileListLabel(
+  profile: Profile,
+  opts: {
+    defaultName: string | null | undefined;
+    activeName: string | null | undefined;
+  },
+): string {
+  const display = profile.displayName || profile.name;
+  const parts: string[] = [];
+  if (profile.displayName !== profile.name) parts.push(profile.name);
+  if (profile.name === opts.defaultName) parts.push("默认");
+  if (profile.name === opts.activeName) parts.push("已启用");
+  return parts.length ? `${display}（${parts.join(" · ")}）` : display;
+}
+
 export async function promptProfileDraft(
   tool: Tool,
   partial: Partial<{
@@ -273,23 +322,7 @@ export async function promptProfileDraft(
 
   let name = partial.name;
   if (!name) {
-    const v = await p.text({
-      message: "Profile 名称（用于命令行引用）",
-      placeholder: preset.id === "custom" ? "my-provider" : preset.id,
-      validate: (val) => {
-        if (!val?.trim()) return "名称不能为空";
-        try {
-          assertValidProfileName(val.trim());
-        } catch (e) {
-          return e instanceof Error ? e.message : "名称无效";
-        }
-        if (profileExists(tool, val.trim())) {
-          return `「${val.trim()}」已存在`;
-        }
-      },
-    });
-    exitOnCancel(v);
-    name = v.trim();
+    name = generateProfileName(tool);
   } else {
     assertValidProfileName(name);
     if (profileExists(tool, name)) {
@@ -300,41 +333,12 @@ export async function promptProfileDraft(
   let displayName = partial.displayName;
   if (!displayName) {
     const v = await p.text({
-      message: "显示名称",
-      initialValue: preset.id === "custom" ? name : preset.displayName,
+      message: "显示名称（回车使用默认值，也可修改）",
+      initialValue:
+        preset.id === "custom" ? suggestDisplayName(tool) : preset.displayName,
     });
     exitOnCancel(v);
     displayName = v.trim() || name;
-  }
-
-  let apiFormat: ApiFormat;
-  let bridgeMode: "chat" | "completions" | undefined;
-
-  if (partial.apiFormat) {
-    apiFormat = partial.apiFormat;
-    bridgeMode = partial.bridgeMode;
-  } else if (preset.id === "custom") {
-    if (tool === "claude") {
-      // Claude custom: Chat Completions only, translated via local bridge.
-      apiFormat = "openai-chat";
-      bridgeMode = undefined;
-    } else {
-      const upstream = await promptOpenAiCompatibleUpstream(tool, {
-        apiFormat: "openai-chat",
-        bridgeMode: "chat",
-      });
-      apiFormat = upstream.apiFormat;
-      bridgeMode = upstream.bridgeMode;
-    }
-  } else {
-    apiFormat = preset.apiFormat;
-    bridgeMode = undefined;
-  }
-
-  if (!isApiFormat(apiFormat) || !supportedFormats(tool).includes(apiFormat)) {
-    throw new Error(
-      `${tool} 不支持格式 ${apiFormat}。可用：${supportedFormats(tool).join(", ")}`,
-    );
   }
 
   let baseUrl = partial.baseUrl;
@@ -351,14 +355,6 @@ export async function promptProfileDraft(
     exitOnCancel(v);
     baseUrl = v.trim();
   }
-  {
-    const before = baseUrl.trim().replace(/\/+$/, "");
-    const normalized = normalizeBaseUrlForFormat(apiFormat, baseUrl);
-    if (normalized !== before) {
-      p.log.info(`已自动将 Base URL 规范为 ${normalized}`);
-    }
-    baseUrl = normalized;
-  }
 
   let apiKey = partial.apiKey;
   if (apiKey === undefined) {
@@ -372,7 +368,7 @@ export async function promptProfileDraft(
     apiKey = v || "";
   }
 
-  // Proxy before model fetch so listing can go through the same upstream proxy.
+  // Proxy before probing / model fetch so requests go through the same upstream.
   let proxyUrl = partial.proxy;
 
   if (proxyUrl === undefined) {
@@ -396,6 +392,74 @@ export async function promptProfileDraft(
   }
 
   const proxy = buildProxyConfig({ url: proxyUrl });
+
+  let apiFormat: ApiFormat;
+  let bridgeMode: "chat" | "completions" | undefined;
+
+  if (partial.apiFormat) {
+    apiFormat = partial.apiFormat;
+    bridgeMode = partial.bridgeMode;
+  } else if (preset.id !== "custom") {
+    apiFormat = preset.apiFormat;
+    bridgeMode = undefined;
+  } else {
+    // 自定义上游：自动识别接口类型，识别失败才让用户手动选择
+    const spin = p.spinner();
+    spin.start("正在识别接口类型…");
+    const detected = await detectApiFormat(tool, {
+      baseUrl,
+      apiKey: apiKey || "",
+      proxy,
+    });
+    if (detected.detected) {
+      apiFormat = detected.apiFormat;
+      bridgeMode = detected.bridgeMode;
+      spin.stop(
+        detected.source === "ollama-tags"
+          ? "已识别接口：Ollama 本地（OpenAI Chat Completions）"
+          : `已识别接口：${formatLabel(apiFormat)}`,
+      );
+      if (
+        detected.resolvedBaseUrl &&
+        detected.resolvedBaseUrl !== baseUrl.trim().replace(/\/+$/, "")
+      ) {
+        p.log.info(
+          `已根据可用接口将 Base URL 规范为 ${detected.resolvedBaseUrl}（原输入：${baseUrl}）`,
+        );
+        baseUrl = detected.resolvedBaseUrl;
+      }
+    } else {
+      spin.stop("未能自动识别接口类型");
+      p.log.warn("未能自动识别接口类型，请手动选择。");
+      if (tool === "claude") {
+        // Claude 自定义上游历史默认：Chat Completions，经本地桥转换
+        apiFormat = "openai-chat";
+        bridgeMode = undefined;
+      } else {
+        const upstream = await promptOpenAiCompatibleUpstream(tool, {
+          apiFormat: "openai-chat",
+          bridgeMode: "chat",
+        });
+        apiFormat = upstream.apiFormat;
+        bridgeMode = upstream.bridgeMode;
+      }
+    }
+  }
+
+  if (!isApiFormat(apiFormat) || !supportedFormats(tool).includes(apiFormat)) {
+    throw new Error(
+      `${tool} 不支持格式 ${apiFormat}。可用：${supportedFormats(tool).join(", ")}`,
+    );
+  }
+
+  {
+    const before = baseUrl.trim().replace(/\/+$/, "");
+    const normalized = normalizeBaseUrlForFormat(apiFormat, baseUrl);
+    if (normalized !== before) {
+      p.log.info(`已自动将 Base URL 规范为 ${normalized}`);
+    }
+    baseUrl = normalized;
+  }
 
   if (tool === "codex" && apiFormat === "openai-chat" && !bridgeMode) {
     bridgeMode = "chat";
@@ -439,7 +503,9 @@ export async function promptProfileDraft(
   };
 
   saveProfile(tool, profile);
-  p.log.success(`已保存供应商「${name}」`);
+  p.log.success(
+    `已保存供应商「${profile.displayName}」（${profile.name}，名称与显示名称均可引用）`,
+  );
   return profile;
 }
 
@@ -620,7 +686,7 @@ async function selectModelsFromFetched(
   );
 
   const picked = await p.multiselect({
-    message: "选择要保存到 profile 的模型（空格选择，回车确认）",
+    message: "选择启用模型（多选，空格选择，回车确认）",
     options: fetched.map((id) => ({
       value: id,
       label: id,
@@ -683,11 +749,6 @@ export async function tryFetchModels(input: {
   apiKey: string;
   proxy?: ProxyConfig;
 }): Promise<{ models: string[]; resolvedBaseUrl?: string } | null> {
-  if (!input.apiKey.trim()) {
-    p.log.info("未填写 API Key，跳过自动拉取模型列表。");
-    return null;
-  }
-
   const spin = p.spinner();
   spin.start("正在从接口拉取模型列表…");
   try {
