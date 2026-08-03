@@ -17,6 +17,7 @@ import {
 } from "../store/profiles.js";
 import { formatProxySummary } from "../utils/proxy.js";
 import { runToolFlow } from "./setup-cmd.js";
+import { launchTool } from "./launch.js";
 import {
   exitOnCancel,
   formatProfileListLabel,
@@ -67,7 +68,13 @@ export function registerToolCommand(program: Command, tool: Tool): void {
     .action(async (name?: string, opts?: { json?: boolean }) => {
       ensureDefaultProvider(tool);
       const profileName = await resolveProfileName(tool, name);
-      const profile = resolveProfileOrThrow(tool, profileName);
+      let profile = resolveProfileOrThrow(tool, profileName);
+
+      // 交互模式下：启用前可选切换默认模型
+      if (!opts?.json && process.stdin.isTTY) {
+        profile = await maybePickDefaultModel(tool, profile);
+      }
+
       const result = await applyProfile(tool, profile);
       if (opts?.json) {
         console.log(JSON.stringify(result, null, 2));
@@ -77,6 +84,10 @@ export function registerToolCommand(program: Command, tool: Tool): void {
       console.log(`配置文件：${result.configPath}`);
       if (result.backupPath) console.log(`备份：${result.backupPath}`);
       console.log(result.restartHint);
+
+      if (process.stdin.isTTY) {
+        await maybeLaunchNow(tool, profile);
+      }
     });
 
   cmd
@@ -345,6 +356,86 @@ function printProfileDetails(
       .join("\n"),
     flags.title || `${tool} / ${profile.name}`,
   );
+}
+
+/**
+ * 启用供应商前：若模型列表内有多个候选，交互选择默认模型；
+ * 只有一个模型时直接跳过。支持手动输入不在列表中的模型 ID。
+ */
+async function maybePickDefaultModel(
+  tool: Tool,
+  profile: Profile,
+): Promise<Profile> {
+  const list = profile.models.list.length
+    ? profile.models.list
+    : [profile.models.default];
+
+  if (list.length <= 1) return profile;
+
+  const picked = await p.select({
+    message: `选择 ${profile.displayName || profile.name} 的默认模型`,
+    options: [
+      ...list.map((model) => ({
+        value: model,
+        label: model,
+        hint: model === profile.models.default ? "当前默认" : undefined,
+      })),
+      { value: "__manual__", label: "手动输入模型 ID" },
+    ],
+    initialValue: profile.models.default,
+  });
+  exitOnCancel(picked);
+
+  let model = picked;
+  if (picked === "__manual__") {
+    const input = await p.text({
+      message: "模型 ID",
+      placeholder: profile.models.default,
+    });
+    if (p.isCancel(input) || !input.trim()) {
+      p.cancel("已取消");
+      process.exit(0);
+    }
+    model = input.trim();
+  }
+
+  if (model === profile.models.default) return profile;
+
+  const updated: Profile = {
+    ...profile,
+    models: {
+      ...profile.models,
+      default: model,
+      list: profile.models.list.includes(model)
+        ? profile.models.list
+        : [...profile.models.list, model],
+    },
+  };
+  saveProfile(tool, updated);
+  return requireProfile(tool, updated.name);
+}
+
+/** 启用完成后：询问是否立即启动该工具。 */
+async function maybeLaunchNow(tool: Tool, profile: Profile): Promise<void> {
+  const launch = await p.confirm({
+    message: `是否现在启动 ${tool}？`,
+    initialValue: true,
+  });
+  if (p.isCancel(launch)) {
+    p.cancel("已取消");
+    process.exit(0);
+  }
+  if (!launch) return;
+
+  try {
+    await launchTool({ tool, profile: profile.name });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    p.log.error(msg);
+    p.log.warn(
+      `未能启动。稍后可用：llms launch ${tool}，或设置 ${tool.toUpperCase()}_BIN 指定可执行文件。`,
+    );
+  }
 }
 
 async function configureProfileModels(
