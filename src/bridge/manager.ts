@@ -62,8 +62,15 @@ export function profileNeedsBridge(profile: Profile): boolean {
   return profile.apiFormat === "openai-chat";
 }
 
+function isBunRuntime(): boolean {
+  return typeof (process as { versions?: { bun?: string } }).versions?.bun ===
+    "string";
+}
+
 export function bridgeToolForCliTool(tool: Tool): BridgeTool | null {
-  return tool === "codex" || tool === "claude" ? tool : null;
+  return tool === "codex" || tool === "claude" || tool === "opencode"
+    ? tool
+    : null;
 }
 
 export function upstreamFromProfile(
@@ -265,16 +272,25 @@ export async function startBridgeDaemon(
     pid: null,
   }));
 
-  const entry = resolveCliEntry();
-  const args = [entry, "bridge", "serve", "--host", host, "--port", String(port)];
+  const runner = resolveBridgeDaemonRunner();
+  const args = [
+    runner.entry,
+    "bridge",
+    "serve",
+    "--host",
+    host,
+    "--port",
+    String(port),
+  ];
   if (allowRemote) args.push("--allow-remote");
-  const child = spawn(process.execPath, args, {
+  const child = spawn(runner.command, args, {
     detached: true,
     stdio: "ignore",
     env: {
       ...process.env,
       LLM_SWITCH_BRIDGE_PORT: String(port),
       LLM_SWITCH_BRIDGE_HOST: host,
+      LLM_SWITCH_BRIDGE_RUNTIME: runner.command,
     },
   });
   child.unref();
@@ -338,6 +354,11 @@ export async function runBridgeForeground(
   port: number,
   allowRemote = false,
 ): Promise<void> {
+  if (process.env.LLM_SWITCH_BRIDGE_RUNTIME !== "node" && isBunRuntime()) {
+    console.error(
+      "注意：bridge 当前由 Bun 运行，Bun 会本地解析 DNS，可能导致 socks5h 代理出口地区错误。建议用「node dist/index.js bridge serve」运行。",
+    );
+  }
   assertBridgeListenerAllowed(host, allowRemote);
   const listener = resolveBridgeListener({ host, port, allowRemote });
   const previous = readBridgeState();
@@ -425,12 +446,29 @@ export async function runBridgeForeground(
   process.removeListener("SIGTERM", onSignal);
 }
 
-function resolveCliEntry(): string {
+/**
+ * Resolve how the detached bridge daemon is launched. The bridge must run under
+ * Node.js: Bun's node:https stack resolves target DNS locally, which defeats
+ * socks5h remote-DNS and can produce wrong-region egress. Node delegates the
+ * hostname to the socks agent, giving correct remote-DNS behavior.
+ */
+function resolveBridgeDaemonRunner(): { command: string; entry: string } {
+  const candidates = [
+    fileURLToPath(new URL("../index.js", import.meta.url)),
+    fileURLToPath(new URL("../../dist/index.js", import.meta.url)),
+    fileURLToPath(new URL("../index.ts", import.meta.url)),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      if (candidate.endsWith(".js")) {
+        return { command: "node", entry: candidate };
+      }
+      return { command: process.execPath, entry: candidate };
+    }
+  }
   const running = process.argv[1];
-  if (running && existsSync(running)) return running;
-  const compiled = fileURLToPath(new URL("../index.js", import.meta.url));
-  if (existsSync(compiled)) return compiled;
-  const source = fileURLToPath(new URL("../index.ts", import.meta.url));
-  if (existsSync(source)) return source;
+  if (running && existsSync(running)) {
+    return { command: process.execPath, entry: running };
+  }
   throw new BridgeControlError("无法定位 llmswitch 入口文件");
 }

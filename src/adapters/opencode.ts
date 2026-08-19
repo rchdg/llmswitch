@@ -12,6 +12,10 @@ import {
   getOpenCodeConfigPath,
 } from "../utils/paths.js";
 import { setActiveProfile } from "../store/profiles.js";
+import {
+  ensureBridgeForProfile,
+  profileNeedsBridge,
+} from "../bridge/manager.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -44,7 +48,10 @@ export function readOpenCodeAuth(path = getOpenCodeAuthPath()): JsonObject {
   return JSON.parse(readFileSync(path, "utf8")) as JsonObject;
 }
 
-export function buildOpenCodeProviderBlock(profile: Profile): JsonObject {
+export function buildOpenCodeProviderBlock(
+  profile: Profile,
+  overrides?: { baseURL?: string; apiKey?: string },
+): JsonObject {
   const models: JsonObject = {};
   for (const id of profile.models.list) {
     models[id] = { name: id };
@@ -54,10 +61,13 @@ export function buildOpenCodeProviderBlock(profile: Profile): JsonObject {
   }
 
   const options: JsonObject = {
-    baseURL: normalizeBaseUrlForFormat(profile.apiFormat, profile.baseUrl),
+    baseURL:
+      overrides?.baseURL ||
+      normalizeBaseUrlForFormat(profile.apiFormat, profile.baseUrl),
   };
-  if (profile.apiKey) {
-    options.apiKey = profile.apiKey;
+  const apiKey = overrides?.apiKey ?? profile.apiKey;
+  if (apiKey) {
+    options.apiKey = apiKey;
   }
   if (profile.headers && Object.keys(profile.headers).length > 0) {
     options.headers = { ...profile.headers };
@@ -74,20 +84,25 @@ export function buildOpenCodeProviderBlock(profile: Profile): JsonObject {
 export function buildOpenCodeConfig(
   existing: JsonObject,
   profile: Profile,
+  overrides?: { baseURL?: string; apiKey?: string },
 ): JsonObject {
   assertCompatible("opencode", profile.apiFormat);
   const id = providerId(profile.name);
   const providers = {
     ...((existing.provider as JsonObject) || {}),
   };
-  providers[id] = buildOpenCodeProviderBlock(profile);
+  providers[id] = buildOpenCodeProviderBlock(profile, overrides);
 
-  // Optional top-level env for proxy (OpenCode may pass through)
+  // Optional top-level env for proxy (OpenCode may pass through). When the
+  // profile routes through the bridge, the upstream proxy is applied inside the
+  // bridge; skip env-var proxy injection so OpenCode doesn't apply its own.
   const env = {
     ...((existing.env as Record<string, string>) || {}),
   };
   clearProxyEnvKeys(env);
-  applyProxyToEnvRecord(env, profile.proxy);
+  if (!overrides) {
+    applyProxyToEnvRecord(env, profile.proxy);
+  }
 
   const next: JsonObject = {
     ...existing,
@@ -121,10 +136,15 @@ export function buildOpenCodeAuth(
   return next;
 }
 
-export function applyOpenCodeProfile(profile: Profile): ApplyResult {
+export async function applyOpenCodeProfile(profile: Profile): Promise<ApplyResult> {
   assertCompatible("opencode", profile.apiFormat);
   ensureDir(getOpenCodeConfigDir());
   ensureDir(dirname(getOpenCodeAuthPath()));
+
+  let bridgeConnection: { baseUrl: string; clientToken: string } | null = null;
+  if (profileNeedsBridge(profile)) {
+    bridgeConnection = await ensureBridgeForProfile(profile, "opencode");
+  }
 
   const configPath = getOpenCodeConfigPath();
   const authPath = getOpenCodeAuthPath();
@@ -136,10 +156,21 @@ export function applyOpenCodeProfile(profile: Profile): ApplyResult {
   );
   backupFile(authPath, getBackupsDir("opencode"), "auth");
 
-  const nextConfig = buildOpenCodeConfig(existing, profile);
+  const nextConfig = buildOpenCodeConfig(
+    existing,
+    profile,
+    bridgeConnection
+      ? { baseURL: bridgeConnection.baseUrl, apiKey: bridgeConnection.clientToken }
+      : undefined,
+  );
+
   atomicWriteFile(configPath, JSON.stringify(nextConfig, null, 2) + "\n");
 
-  const nextAuth = buildOpenCodeAuth(readOpenCodeAuth(authPath), profile);
+  const bridgeApiKey = bridgeConnection?.clientToken || profile.apiKey;
+  const nextAuth = buildOpenCodeAuth(
+    readOpenCodeAuth(authPath),
+    { ...profile, apiKey: bridgeApiKey },
+  );
   atomicWriteFile(authPath, JSON.stringify(nextAuth, null, 2) + "\n");
 
   setActiveProfile("opencode", profile.name);
@@ -149,7 +180,9 @@ export function applyOpenCodeProfile(profile: Profile): ApplyResult {
     profile: profile.name,
     configPath,
     backupPath,
-    restartHint: "请重新启动 OpenCode 会话以使配置与代理生效。",
+    restartHint: bridgeConnection
+      ? "已通过本地 bridge 启用供应商（上游代理在 bridge 内生效）。请重新启动 OpenCode 会话使配置生效。"
+      : "请重新启动 OpenCode 会话以使配置与代理生效。",
   };
 }
 

@@ -2,7 +2,7 @@ import type { ProxyConfig } from "../types.js";
 
 export type BridgeUpstreamMode = "chat" | "completions";
 
-export type BridgeTool = "codex" | "claude";
+export type BridgeTool = "codex" | "claude" | "opencode";
 
 export interface BridgeUpstream {
   baseUrl: string;
@@ -22,6 +22,7 @@ export interface BridgeUpstream {
 export interface BridgeUpstreams {
   codex: BridgeUpstream | null;
   claude: BridgeUpstream | null;
+  opencode: BridgeUpstream | null;
 }
 
 export interface BridgeListenerState {
@@ -67,9 +68,13 @@ export const DEFAULT_BRIDGE_PORT = 17890;
 export const DEFAULT_BRIDGE_HOST = "127.0.0.1";
 
 export function emptyUpstreams(): BridgeUpstreams {
-  return { codex: null, claude: null };
+  return { codex: null, claude: null, opencode: null };
 }
 
 export function hasAnyUpstream(upstreams: BridgeUpstreams): boolean {
-  return Boolean(upstreams.codex?.baseUrl || upstreams.claude?.baseUrl);
+  return Boolean(
+    upstreams.codex?.baseUrl ||
+      upstreams.claude?.baseUrl ||
+      upstreams.opencode?.baseUrl,
+  );
 }

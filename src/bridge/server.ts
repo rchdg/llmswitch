@@ -68,11 +68,11 @@ function bearerToken(req: IncomingMessage): string | undefined {
 function authenticateDataRequest(
   req: IncomingMessage,
   upstream: BridgeUpstream | null,
-  tool: "codex" | "claude",
+  tool: "codex" | "claude" | "opencode",
 ): boolean {
   if (!upstream?.clientToken || upstream.migrationRequired) return false;
   const bearer = bearerToken(req);
-  if (tool === "codex") {
+  if (tool === "codex" || tool === "opencode") {
     return constantTimeTokenEqual(upstream.clientToken, bearer);
   }
   const apiKey = headerValue(req.headers["x-api-key"]);
@@ -88,7 +88,8 @@ function authenticateModelsRequest(
 ): boolean {
   return (
     authenticateDataRequest(req, upstreams.codex, "codex") ||
-    authenticateDataRequest(req, upstreams.claude, "claude")
+    authenticateDataRequest(req, upstreams.claude, "claude") ||
+    authenticateDataRequest(req, upstreams.opencode, "opencode")
   );
 }
 
@@ -222,7 +223,7 @@ async function proxyModelsMerged(
   res: ServerResponse,
   upstreams: BridgeUpstreams,
 ): Promise<void> {
-  const sides = [upstreams.codex, upstreams.claude].filter(
+  const sides = [upstreams.codex, upstreams.claude, upstreams.opencode].filter(
     (u): u is BridgeUpstream => Boolean(u?.baseUrl),
   );
   if (!sides.length) {
@@ -420,14 +421,75 @@ async function forwardChatResponses(
   );
 }
 
+/**
+ * OpenCode-facing passthrough: forward an OpenAI chat request verbatim to the
+ * upstream `/chat/completions` (with llm-switch transport applying the proxy)
+ * and relay the raw response, preserving streaming for SSE.
+ */
+async function forwardOpenCodeChat(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  upstream: BridgeUpstream,
+  bodyBuf: Buffer,
+): Promise<void> {
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(bodyBuf.toString("utf8")) as Record<string, unknown>;
+  } catch {
+    sendJson(res, 400, { error: { message: "Invalid JSON body" } });
+    return;
+  }
+
+  const wantStream = Boolean(body.stream);
+  const url = joinUrl(upstream.baseUrl, "/chat/completions");
+
+  let response: NodeTransportResponse;
+  try {
+    response = await requestUpstream(
+      upstream,
+      url,
+      "POST",
+      bodyBuf.toString("utf8"),
+    );
+  } catch (err) {
+    sendJson(res, 502, {
+      error: {
+        message: `Upstream chat 请求失败: ${err instanceof Error ? err.message : String(err)}`,
+      },
+    });
+    return;
+  }
+
+  if (!response.ok) {
+    const text = await response.text();
+    res.writeHead(response.status, {
+      "Content-Type":
+        response.headers.get("content-type") || "application/json",
+    });
+    res.end(text);
+    return;
+  }
+
+  if (!wantStream) {
+    const text = await response.text();
+    res.writeHead(response.status, {
+      "Content-Type":
+        response.headers.get("content-type") || "application/json",
+    });
+    res.end(text);
+    return;
+  }
+
+  await pipeRawStream(response, res);
+}
+
 async function forwardCompletions(
   _req: IncomingMessage,
   res: ServerResponse,
   upstream: BridgeUpstream,
   body: Record<string, unknown>,
   wantStream: boolean,
-): Promise<void> {
-  const completionReq = responsesToCompletionsRequest(body);
+): Promise<void> {  const completionReq = responsesToCompletionsRequest(body);
   const customTools = collectCustomToolNames(body.tools);
   const url = joinUrl(upstream.baseUrl, "/completions");
 
@@ -616,6 +678,36 @@ async function pipeChatStreamToAnthropic(
   }
 }
 
+/** Relay an upstream SSE stream verbatim (OpenCode chat passthrough). */
+async function pipeRawStream(
+  upstream: NodeTransportResponse,
+  res: ServerResponse,
+): Promise<void> {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+
+  const reader = upstream.body?.getReader();
+  if (!reader) {
+    res.end();
+    return;
+  }
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(value);
+    }
+  } catch {
+    // Connection dropped; best-effort close.
+  } finally {
+    res.end();
+  }
+}
+
 export function createBridgeServer(options: BridgeServerOptions = {}): Server {
   return createServer(async (req, res) => {
     try {
@@ -665,6 +757,13 @@ export function createBridgeServer(options: BridgeServerOptions = {}): Server {
                   mode: merged.claude.mode,
                   profile: merged.claude.profileName || null,
                   migrationRequired: merged.claude.migrationRequired === true,
+                }
+              : null,
+            opencode: merged.opencode
+              ? {
+                  mode: merged.opencode.mode,
+                  profile: merged.opencode.profileName || null,
+                  migrationRequired: merged.opencode.migrationRequired === true,
                 }
               : null,
           },
@@ -778,9 +877,36 @@ export function createBridgeServer(options: BridgeServerOptions = {}): Server {
         return;
       }
 
+      if (
+        req.method === "POST" &&
+        (path === "/v1/chat/completions" || path === "/chat/completions")
+      ) {
+        if (!merged.opencode?.baseUrl) {
+          sendJson(res, 503, {
+            error: {
+              message:
+                "Bridge 未配置 OpenCode 上游。请先 llms opencode use <openai-chat profile>",
+            },
+          });
+          return;
+        }
+        if (!authenticateDataRequest(req, merged.opencode, "opencode")) {
+          sendJson(res, 401, {
+            error: {
+              code: "invalid_bridge_token",
+              message: "Bridge token 无效；请重新执行 llms opencode use <profile>",
+            },
+          });
+          return;
+        }
+        const body = await readBody(req);
+        await forwardOpenCodeChat(req, res, merged.opencode, body);
+        return;
+      }
+
       sendJson(res, 404, {
         error: {
-          message: `Bridge 支持 GET /v1/models、POST /v1/responses、POST /v1/messages（当前: ${req.method} ${path}）`,
+          message: `Bridge 支持 GET /v1/models、POST /v1/responses、POST /v1/messages、POST /v1/chat/completions（当前: ${req.method} ${path}）`,
         },
       });
     } catch (err) {

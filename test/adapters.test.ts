@@ -241,10 +241,10 @@ describe("opencode adapter", () => {
     expect(block.options.baseURL).toBe("http://127.0.0.1:8000/v1");
   });
 
-  test("apply writes config", () => {
+  test("apply writes config", async () => {
     const profile = sample({ name: "or", apiFormat: "anthropic" });
     saveProfile("opencode", profile);
-    const result = applyOpenCodeProfile(profile);
+    const result = await applyOpenCodeProfile(profile);
     expect(existsSync(result.configPath)).toBe(true);
   });
 });

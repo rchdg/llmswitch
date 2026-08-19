@@ -97,7 +97,12 @@ export function constantTimeTokenEqual(
 function isLegacyUpstream(raw: unknown): raw is BridgeUpstream {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
   const row = raw as Record<string, unknown>;
-  return typeof row.baseUrl === "string" && !("codex" in row) && !("claude" in row);
+  return (
+    typeof row.baseUrl === "string" &&
+    !("codex" in row) &&
+    !("claude" in row) &&
+    !("opencode" in row)
+  );
 }
 
 export function normalizeBridgeUpstreams(raw: unknown): BridgeUpstreams {
@@ -106,11 +111,12 @@ export function normalizeBridgeUpstreams(raw: unknown): BridgeUpstreams {
   }
   const row = raw as Record<string, unknown>;
   if (isLegacyUpstream(raw)) {
-    return { codex: raw, claude: null };
+    return { codex: raw, claude: null, opencode: null };
   }
   return {
     codex: (row.codex as BridgeUpstream | null | undefined) ?? null,
     claude: (row.claude as BridgeUpstream | null | undefined) ?? null,
+    opencode: (row.opencode as BridgeUpstream | null | undefined) ?? null,
   };
 }
 
@@ -205,6 +211,7 @@ function readLegacyMigrationState(): BridgeRuntimeState | null {
       upstreams: {
         codex: markUpstreamMigrationRequired(upstreams.codex),
         claude: markUpstreamMigrationRequired(upstreams.claude),
+        opencode: markUpstreamMigrationRequired(upstreams.opencode),
       },
       pending: null,
     });
@@ -275,6 +282,7 @@ function persistState(next: BridgeRuntimeState): void {
     upstreams: {
       codex: next.upstreams.codex,
       claude: next.upstreams.claude,
+      opencode: next.upstreams.opencode,
     },
     pending: next.pending,
   };

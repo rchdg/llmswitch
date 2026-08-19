@@ -152,10 +152,11 @@ describe("bridge upstream migration", () => {
     expect(normalizeBridgeUpstreams(legacy)).toEqual({
       codex: legacy,
       claude: null,
+      opencode: null,
     });
   });
 
-  test("new dual format preserved", () => {
+  test("new triple format preserved", () => {
     const dual = {
       codex: {
         baseUrl: "http://a/v1",
@@ -166,6 +167,12 @@ describe("bridge upstream migration", () => {
       claude: {
         baseUrl: "http://b/v1",
         apiKey: "b",
+        mode: "chat" as const,
+        updatedAt: "t",
+      },
+      opencode: {
+        baseUrl: "http://c/v1",
+        apiKey: "c",
         mode: "chat" as const,
         updatedAt: "t",
       },

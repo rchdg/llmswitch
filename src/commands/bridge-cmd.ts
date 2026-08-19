@@ -110,6 +110,7 @@ export function registerBridgeCommand(program: Command): void {
         upstreams: {
           codex: summarize(state.upstreams.codex),
           claude: summarize(state.upstreams.claude),
+          opencode: summarize(state.upstreams.opencode),
         },
       };
       if (opts.json) {
@@ -118,9 +119,9 @@ export function registerBridgeCommand(program: Command): void {
       }
       console.log(`状态：${alive ? "运行中" : "未运行"}`);
       console.log(`根地址：${data.rootUrl}`);
-      console.log(`Codex base：${data.codexBaseUrl}`);
+      console.log(`Codex/OpenCode base：${data.codexBaseUrl}`);
       console.log(`PID：${pid ?? "-"}`);
-      for (const tool of ["codex", "claude"] as const) {
+      for (const tool of ["codex", "claude", "opencode"] as const) {
         const u = data.upstreams[tool];
         if (u) {
           console.log(
