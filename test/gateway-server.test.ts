@@ -3,8 +3,14 @@ import { createServer, type Server } from "node:http";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createGatewayServer } from "../src/gateway/server.ts";
-import { createGatewayKey, resetRateLimits } from "../src/gateway/keys.ts";
+import { createGatewayServer, upstreamUrl } from "../src/gateway/server.ts";
+import {
+  createGatewayKey,
+  resetRateLimits,
+  updateGatewayKey,
+  rotateGatewayKey,
+} from "../src/gateway/keys.ts";
+import { summarizeUsage } from "../src/gateway/usage.ts";
 import {
   saveGatewayProvider,
   saveGatewayRoute,
@@ -995,5 +1001,800 @@ describe("auxiliary endpoints", () => {
     expect(response.status).toBe(404);
     const body = (await response.json()) as Record<string, any>;
     expect(body.error.code).toBe("model_not_found");
+  });
+});
+
+describe("key scope alias matching", () => {
+  test("a key scoped to an alias keeps working when the route maps to another upstream id", async () => {
+    const upstream = await startUpstream((_record, respond) =>
+      respond(200, chatCompletionPayload("hi")),
+    );
+    addProvider({
+      name: "alpha",
+      baseUrl: `${upstream.url}/v1`,
+      apiFormat: "openai-chat",
+      models: ["gpt-4o-2024-11"],
+    });
+    saveGatewayRoute({
+      alias: "gpt-4o",
+      provider: "alpha",
+      model: "gpt-4o-2024-11",
+      updatedAt: new Date().toISOString(),
+    });
+    const key = createGatewayKey({ name: "aliased", models: ["gpt-4o"] });
+
+    const response = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key.plaintext}`,
+      },
+      body: JSON.stringify({ model: "gpt-4o", messages: [] }),
+    });
+    expect(response.status).toBe(200);
+    expect(upstream.requests[0]?.body.model).toBe("gpt-4o-2024-11");
+  });
+
+  test("a key scoped to a qualified provider/model entry matches both spellings", async () => {
+    const upstream = await startUpstream((_record, respond) =>
+      respond(200, chatCompletionPayload("hi")),
+    );
+    addProvider({
+      name: "alpha",
+      baseUrl: `${upstream.url}/v1`,
+      apiFormat: "openai-chat",
+    });
+    const key = createGatewayKey({
+      name: "qualified",
+      models: ["alpha/test-model"],
+    });
+
+    const bare = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key.plaintext}`,
+      },
+      body: JSON.stringify({ model: "alpha/test-model", messages: [] }),
+    });
+    expect(bare.status).toBe(200);
+
+    const direct = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key.plaintext}`,
+      },
+      body: JSON.stringify({ model: "test-model", messages: [] }),
+    });
+    expect(direct.status).toBe(200);
+  });
+
+  test("a key scoped to one provider never matches another provider's model", async () => {
+    const upstream = await startUpstream((_record, respond) =>
+      respond(200, chatCompletionPayload("hi")),
+    );
+    addProvider({
+      name: "alpha",
+      baseUrl: `${upstream.url}/v1`,
+      apiFormat: "openai-chat",
+    });
+    addProvider({
+      name: "beta",
+      baseUrl: `${upstream.url}/v1`,
+      apiFormat: "openai-chat",
+    });
+    const key = createGatewayKey({
+      name: "strict",
+      providers: ["alpha"],
+      models: ["beta/test-model"],
+    });
+
+    const response = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key.plaintext}`,
+      },
+      body: JSON.stringify({ model: "test-model", messages: [] }),
+    });
+    expect(response.status).toBe(403);
+  });
+
+  test("the model catalogue reflects alias scopes", async () => {
+    addProvider({
+      name: "alpha",
+      baseUrl: "https://alpha.test/v1",
+      apiFormat: "openai-chat",
+      models: ["m1"],
+    });
+    saveGatewayRoute({
+      alias: "friendly",
+      provider: "alpha",
+      model: "m1",
+      updatedAt: new Date().toISOString(),
+    });
+    const key = createGatewayKey({ name: "scoped", models: ["friendly"] });
+
+    const response = await fetch(`${gatewayUrl}/v1/models`, {
+      headers: { authorization: `Bearer ${key.plaintext}` },
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { data: Array<Record<string, any>> };
+    const ids = body.data.map((item) => item.id);
+    // Strict scope: the key named the alias, so only that spelling is exposed.
+    expect(ids).toContain("friendly");
+    expect(ids).not.toContain("m1");
+  });
+});
+
+describe("key validation", () => {
+  test("rejects unknown format scopes instead of widening them", () => {
+    expect(() => createGatewayKey({ name: "bad", formats: ["bogus"] })).toThrow(
+      /无效的接口格式/,
+    );
+  });
+
+  test("accepts explicit format scopes", () => {
+    const created = createGatewayKey({
+      name: "good",
+      formats: ["anthropic", "openai-chat"],
+    });
+    expect(created.key.formats).toEqual(["anthropic", "openai-chat"]);
+  });
+});
+
+describe("rate limit semantics", () => {
+  test("rateLimitPerMinute -1 exempts a key from the global default", async () => {
+    const upstream = await startUpstream((_record, respond) =>
+      respond(200, chatCompletionPayload("hi")),
+    );
+    addProvider({
+      name: "alpha",
+      baseUrl: `${upstream.url}/v1`,
+      apiFormat: "openai-chat",
+    });
+    const config = readGatewayConfig();
+    writeGatewayConfig({ ...config, rateLimitPerMinute: 1 });
+    const key = createGatewayKey({ name: "exempt", rateLimitPerMinute: -1 });
+
+    const send = () =>
+      fetch(`${gatewayUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${key.plaintext}`,
+        },
+        body: JSON.stringify({ model: "test-model", messages: [] }),
+      });
+    expect((await send()).status).toBe(200);
+    expect((await send()).status).toBe(200);
+    expect(upstream.requests).toHaveLength(2);
+  });
+
+  test("rateLimitPerMinute 0 inherits the global default", async () => {
+    const upstream = await startUpstream((_record, respond) =>
+      respond(200, chatCompletionPayload("hi")),
+    );
+    addProvider({
+      name: "alpha",
+      baseUrl: `${upstream.url}/v1`,
+      apiFormat: "openai-chat",
+    });
+    const config = readGatewayConfig();
+    writeGatewayConfig({ ...config, rateLimitPerMinute: 1 });
+    const key = createGatewayKey({ name: "inherit" });
+
+    const send = () =>
+      fetch(`${gatewayUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${key.plaintext}`,
+        },
+        body: JSON.stringify({ model: "test-model", messages: [] }),
+      });
+    expect((await send()).status).toBe(200);
+    expect((await send()).status).toBe(429);
+  });
+});
+
+describe("upstream path prefix", () => {
+  test("defaults to /v1 and never duplicates an existing suffix", () => {
+    const provider = (baseUrl: string, pathPrefix?: string) =>
+      ({
+        name: "p",
+        displayName: "p",
+        apiFormat: "openai-chat",
+        baseUrl,
+        apiKey: "",
+        models: [],
+        ...(pathPrefix === undefined ? {} : { pathPrefix }),
+        priority: 100,
+        enabled: true,
+        updatedAt: new Date(0).toISOString(),
+      }) as Parameters<typeof upstreamUrl>[0];
+    expect(upstreamUrl(provider("https://x.test"), "/chat/completions")).toBe(
+      "https://x.test/v1/chat/completions",
+    );
+    expect(upstreamUrl(provider("https://x.test/v1"), "/chat/completions")).toBe(
+      "https://x.test/v1/chat/completions",
+    );
+    expect(
+      upstreamUrl(provider("https://x.test/v1", ""), "/chat/completions"),
+    ).toBe("https://x.test/v1/chat/completions");
+    expect(
+      upstreamUrl(
+        provider("https://x.test/v1beta/openai", ""),
+        "/chat/completions",
+      ),
+    ).toBe("https://x.test/v1beta/openai/chat/completions");
+    expect(
+      upstreamUrl(provider("https://x.test", "v2"), "/chat/completions"),
+    ).toBe("https://x.test/v2/chat/completions");
+  });
+
+  test("routes to a prefix-less upstream verbatim", async () => {
+    const upstream = await startUpstream((_record, respond) =>
+      respond(200, chatCompletionPayload("hi")),
+    );
+    saveGatewayProvider({
+      name: "gemini-compat",
+      displayName: "gemini-compat",
+      apiFormat: "openai-chat",
+      baseUrl: `${upstream.url}/v1beta/openai`,
+      apiKey: "sk-test",
+      models: ["test-model"],
+      pathPrefix: "",
+      priority: 100,
+      enabled: true,
+      sourceProfile: null,
+      updatedAt: new Date().toISOString(),
+    });
+    const key = createGatewayKey({ name: "k" });
+
+    const response = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key.plaintext}`,
+      },
+      body: JSON.stringify({ model: "test-model", messages: [] }),
+    });
+    expect(response.status).toBe(200);
+    expect(upstream.requests[0]?.path).toBe("/v1beta/openai/chat/completions");
+  });
+});
+
+describe("beta header forwarding", () => {
+  test("relays anthropic-beta on an anthropic passthrough", async () => {
+    const upstream = await startUpstream((_record, respond) =>
+      respond(200, {
+        id: "msg_1",
+        type: "message",
+        role: "assistant",
+        model: "test-model",
+        content: [{ type: "text", text: "hi" }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }),
+    );
+    addProvider({
+      name: "claude",
+      baseUrl: upstream.url,
+      apiFormat: "anthropic",
+    });
+    const key = createGatewayKey({ name: "k" });
+
+    const response = await fetch(`${gatewayUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": key.plaintext,
+        "anthropic-beta": "interleaved-thinking-2025-05-14",
+      },
+      body: JSON.stringify({
+        model: "test-model",
+        max_tokens: 16,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    expect(response.status).toBe(200);
+    expect(upstream.requests[0]?.headers["anthropic-beta"]).toBe(
+      "interleaved-thinking-2025-05-14",
+    );
+  });
+
+  test("does not relay beta headers across format conversions", async () => {
+    const upstream = await startUpstream((_record, respond) =>
+      respond(200, chatCompletionPayload("hi")),
+    );
+    addProvider({
+      name: "alpha",
+      baseUrl: `${upstream.url}/v1`,
+      apiFormat: "openai-chat",
+    });
+    const key = createGatewayKey({ name: "k" });
+
+    const response = await fetch(`${gatewayUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": key.plaintext,
+        "anthropic-beta": "some-beta",
+      },
+      body: JSON.stringify({
+        model: "test-model",
+        max_tokens: 16,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    expect(response.status).toBe(200);
+    expect(upstream.requests[0]?.headers["anthropic-beta"]).toBeUndefined();
+  });
+
+  test("provider-configured headers win over forwarded client headers", async () => {
+    const upstream = await startUpstream((_record, respond) =>
+      respond(200, {
+        id: "msg_1",
+        type: "message",
+        role: "assistant",
+        model: "test-model",
+        content: [{ type: "text", text: "hi" }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }),
+    );
+    saveGatewayProvider({
+      name: "claude",
+      displayName: "claude",
+      apiFormat: "anthropic",
+      baseUrl: upstream.url,
+      apiKey: "sk-test",
+      models: ["test-model"],
+      headers: { "anthropic-beta": "provider-pin" },
+      priority: 100,
+      enabled: true,
+      sourceProfile: null,
+      updatedAt: new Date().toISOString(),
+    });
+    const key = createGatewayKey({ name: "k" });
+
+    const response = await fetch(`${gatewayUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": key.plaintext,
+        "anthropic-beta": "client-beta",
+      },
+      body: JSON.stringify({
+        model: "test-model",
+        max_tokens: 16,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    expect(response.status).toBe(200);
+    expect(upstream.requests[0]?.headers["anthropic-beta"]).toBe(
+      "provider-pin",
+    );
+  });
+});
+
+describe("key edit and rotate", () => {
+  test("widening a model scope takes effect on the next request", async () => {
+    const upstream = await startUpstream((_record, respond) =>
+      respond(200, chatCompletionPayload("hi")),
+    );
+    addProvider({
+      name: "alpha",
+      baseUrl: `${upstream.url}/v1`,
+      apiFormat: "openai-chat",
+      models: ["test-model", "other-model"],
+    });
+    const key = createGatewayKey({ name: "scoped", models: ["test-model"] });
+
+    const denied = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key.plaintext}`,
+      },
+      body: JSON.stringify({ model: "other-model", messages: [] }),
+    });
+    expect(denied.status).toBe(403);
+
+    updateGatewayKey(key.key.id, { models: ["test-model", "other-model"] });
+
+    const allowed = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key.plaintext}`,
+      },
+      body: JSON.stringify({ model: "other-model", messages: [] }),
+    });
+    expect(allowed.status).toBe(200);
+  });
+
+  test("editing rejects invalid formats and negative expiry", () => {
+    const key = createGatewayKey({ name: "guard" });
+    expect(() =>
+      updateGatewayKey(key.key.id, { formats: ["nope"] }),
+    ).toThrow(/无效的接口格式/);
+    expect(() =>
+      updateGatewayKey(key.key.id, { expiresInDays: -1 }),
+    ).toThrow(/有效期天数/);
+  });
+
+  test("rotate invalidates the old plaintext and keeps scopes", async () => {
+    const upstream = await startUpstream((_record, respond) =>
+      respond(200, chatCompletionPayload("hi")),
+    );
+    addProvider({
+      name: "alpha",
+      baseUrl: `${upstream.url}/v1`,
+      apiFormat: "openai-chat",
+    });
+    const key = createGatewayKey({ name: "rotating", models: ["test-model"] });
+    const rotated = rotateGatewayKey(key.key.id);
+
+    const oldResponse = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key.plaintext}`,
+      },
+      body: JSON.stringify({ model: "test-model", messages: [] }),
+    });
+    expect(oldResponse.status).toBe(401);
+
+    const newResponse = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${rotated.plaintext}`,
+      },
+      body: JSON.stringify({ model: "test-model", messages: [] }),
+    });
+    expect(newResponse.status).toBe(200);
+    expect(rotated.key.models).toEqual(["test-model"]);
+  });
+
+  test("clearing expiry via edit works", () => {
+    const key = createGatewayKey({ name: "expiry", expiresInDays: 1 });
+    expect(key.key.expiresAt).not.toBeNull();
+    const updated = updateGatewayKey(key.key.id, { expiresInDays: 0 });
+    expect(updated.expiresAt).toBeNull();
+  });
+});
+
+describe("provider breaker", () => {
+  test("a cooling provider is skipped on the next request", async () => {
+    const failing = await startUpstream((_record, respond) =>
+      respond(503, { error: { message: "overloaded" } }),
+    );
+    const healthy = await startUpstream((_record, respond) =>
+      respond(200, chatCompletionPayload("ok")),
+    );
+    addProvider({
+      name: "primary",
+      baseUrl: `${failing.url}/v1`,
+      apiFormat: "openai-chat",
+      priority: 1,
+    });
+    addProvider({
+      name: "backup",
+      baseUrl: `${healthy.url}/v1`,
+      apiFormat: "openai-chat",
+      priority: 2,
+    });
+    const key = createGatewayKey({ name: "k" });
+    const send = () =>
+      fetch(`${gatewayUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${key.plaintext}`,
+        },
+        body: JSON.stringify({ model: "test-model", messages: [] }),
+      });
+
+    const first = await send();
+    expect(first.status).toBe(200);
+    expect(failing.requests).toHaveLength(1);
+
+    // Second request: primary is cooling down, so it is not tried again.
+    const second = await send();
+    expect(second.status).toBe(200);
+    expect(failing.requests).toHaveLength(1);
+    expect(healthy.requests).toHaveLength(2);
+  });
+});
+
+describe("usage accounting", () => {
+  test("records requests and tokens for non-stream completions", async () => {
+    const upstream = await startUpstream((_record, respond) =>
+      respond(200, chatCompletionPayload("hi")),
+    );
+    addProvider({
+      name: "alpha",
+      baseUrl: `${upstream.url}/v1`,
+      apiFormat: "openai-chat",
+    });
+    const key = createGatewayKey({ name: "k" });
+
+    await fetch(`${gatewayUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key.plaintext}`,
+      },
+      body: JSON.stringify({ model: "test-model", messages: [] }),
+    });
+
+    const rows = summarizeUsage({ days: 1 });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      key: key.key.id,
+      provider: "alpha",
+      model: "test-model",
+      requests: 1,
+      inputTokens: 1,
+      outputTokens: 2,
+    });
+  });
+
+  test("records usage for streaming completions", async () => {
+    // Anthropic upstream → OpenAI inbound is a decoded stream, so usage lines
+    // from message_start / message_delta reach the accounting layer.
+    const upstream = await startUpstream((_record, respond) =>
+      respond(200, null, {
+        sse: [
+          `event: message_start\ndata: ${JSON.stringify({
+            type: "message_start",
+            message: {
+              id: "msg_1",
+              model: "claude-upstream",
+              usage: { input_tokens: 3, output_tokens: 0 },
+            },
+          })}\n\n`,
+          `event: content_block_start\ndata: ${JSON.stringify({
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "text", text: "" },
+          })}\n\n`,
+          `event: content_block_delta\ndata: ${JSON.stringify({
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "Hello" },
+          })}\n\n`,
+          `event: message_delta\ndata: ${JSON.stringify({
+            type: "message_delta",
+            delta: { stop_reason: "end_turn" },
+            usage: { output_tokens: 5 },
+          })}\n\n`,
+          `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+        ],
+      }),
+    );
+    addProvider({
+      name: "claude",
+      baseUrl: upstream.url,
+      apiFormat: "anthropic",
+    });
+    const key = createGatewayKey({ name: "k" });
+
+    const response = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key.plaintext}`,
+      },
+      body: JSON.stringify({ model: "test-model", messages: [], stream: true }),
+    });
+    expect(response.status).toBe(200);
+
+    const rows = summarizeUsage({ days: 1 });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      provider: "claude",
+      inputTokens: 3,
+      outputTokens: 5,
+    });
+  });
+});
+
+describe("model detail endpoint", () => {
+  test("returns a single routable model", async () => {
+    addProvider({
+      name: "alpha",
+      baseUrl: "https://alpha.test/v1",
+      apiFormat: "openai-chat",
+      models: ["m1"],
+    });
+    const key = createGatewayKey({ name: "k" });
+
+    const response = await fetch(`${gatewayUrl}/v1/models/m1`, {
+      headers: { authorization: `Bearer ${key.plaintext}` },
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Record<string, any>;
+    expect(body.id).toBe("m1");
+    expect(body.owned_by).toBe("alpha");
+    expect(body.llm_switch.format).toBe("openai-chat");
+  });
+
+  test("404s for unknown or out-of-scope models", async () => {
+    addProvider({
+      name: "alpha",
+      baseUrl: "https://alpha.test/v1",
+      apiFormat: "openai-chat",
+      models: ["m1", "m2"],
+    });
+    const key = createGatewayKey({ name: "scoped", models: ["m1"] });
+
+    const missing = await fetch(`${gatewayUrl}/v1/models/nope`, {
+      headers: { authorization: `Bearer ${key.plaintext}` },
+    });
+    expect(missing.status).toBe(404);
+
+    const denied = await fetch(`${gatewayUrl}/v1/models/m2`, {
+      headers: { authorization: `Bearer ${key.plaintext}` },
+    });
+    expect(denied.status).toBe(404);
+  });
+});
+
+describe("legacy completions", () => {
+  test("translates prompt-based requests into chat and back", async () => {
+    const upstream = await startUpstream((_record, respond) =>
+      respond(200, chatCompletionPayload("legacy hi")),
+    );
+    addProvider({
+      name: "alpha",
+      baseUrl: `${upstream.url}/v1`,
+      apiFormat: "openai-chat",
+    });
+    const key = createGatewayKey({ name: "k" });
+
+    const response = await fetch(`${gatewayUrl}/v1/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key.plaintext}`,
+      },
+      body: JSON.stringify({ model: "test-model", prompt: "say hi" }),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Record<string, any>;
+    expect(body.object).toBe("text_completion");
+    expect(body.model).toBe("test-model");
+    expect(body.choices[0].text).toBe("legacy hi");
+    expect(body.choices[0].finish_reason).toBe("stop");
+    expect(body.usage.total_tokens).toBe(3);
+    expect(upstream.requests[0]?.body.messages).toEqual([
+      { role: "user", content: "say hi" },
+    ]);
+    expect(upstream.requests[0]?.body.prompt).toBeUndefined();
+  });
+
+  test("streams legacy text chunks", async () => {
+    const upstream = await startUpstream((_record, respond) =>
+      respond(200, null, {
+        sse: [
+          'data: {"id":"1","choices":[{"index":0,"delta":{"content":"Hel"}}]}\n\n',
+          'data: {"id":"1","choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":null}]}\n\n',
+          'data: {"id":"1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+          "data: [DONE]\n\n",
+        ],
+      }),
+    );
+    addProvider({
+      name: "alpha",
+      baseUrl: `${upstream.url}/v1`,
+      apiFormat: "openai-chat",
+    });
+    const key = createGatewayKey({ name: "k" });
+
+    const response = await fetch(`${gatewayUrl}/v1/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key.plaintext}`,
+      },
+      body: JSON.stringify({
+        model: "test-model",
+        prompt: "say hi",
+        stream: true,
+      }),
+    });
+    expect(response.status).toBe(200);
+    const text = await readSse(response);
+    expect(text).toContain('"object":"text_completion.chunk"');
+    expect(text).toContain('"text":"Hel"');
+    expect(text).toContain('"text":"lo"');
+    expect(text).toContain('"finish_reason":"stop"');
+    expect(text.trimEnd().endsWith("data: [DONE]")).toBe(true);
+  });
+});
+
+describe("daily quota", () => {
+  test("blocks requests once the daily cap is reached", async () => {
+    const upstream = await startUpstream((_record, respond) =>
+      respond(200, chatCompletionPayload("hi")),
+    );
+    addProvider({
+      name: "alpha",
+      baseUrl: `${upstream.url}/v1`,
+      apiFormat: "openai-chat",
+    });
+    const key = createGatewayKey({ name: "daily", requestsPerDay: 2 });
+    const send = () =>
+      fetch(`${gatewayUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${key.plaintext}`,
+        },
+        body: JSON.stringify({ model: "test-model", messages: [] }),
+      });
+
+    expect((await send()).status).toBe(200);
+    expect((await send()).status).toBe(200);
+    const third = await send();
+    expect(third.status).toBe(429);
+    expect(Number(third.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect(upstream.requests).toHaveLength(2);
+  });
+});
+
+describe("request id", () => {
+  test("echoes a client-supplied x-request-id and forwards it upstream", async () => {
+    const upstream = await startUpstream((_record, respond) =>
+      respond(200, chatCompletionPayload("hi")),
+    );
+    addProvider({
+      name: "alpha",
+      baseUrl: `${upstream.url}/v1`,
+      apiFormat: "openai-chat",
+    });
+    const key = createGatewayKey({ name: "k" });
+
+    const response = await fetch(`${gatewayUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${key.plaintext}`,
+        "x-request-id": "client-req-42",
+      },
+      body: JSON.stringify({ model: "test-model", messages: [] }),
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-request-id")).toBe("client-req-42");
+    expect(upstream.requests[0]?.headers["x-request-id"]).toBe("client-req-42");
+  });
+
+  test("mints a request id when the client sends none", async () => {
+    addProvider({
+      name: "alpha",
+      baseUrl: "https://alpha.test/v1",
+      apiFormat: "openai-chat",
+      models: ["test-model"],
+    });
+    const key = createGatewayKey({ name: "k" });
+
+    const response = await fetch(`${gatewayUrl}/v1/models`, {
+      headers: { authorization: `Bearer ${key.plaintext}` },
+    });
+    expect(response.status).toBe(200);
+    const id = response.headers.get("x-request-id");
+    expect(id).toBeTruthy();
+    expect(id).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  test("401 responses advertise WWW-Authenticate", async () => {
+    const response = await fetch(`${gatewayUrl}/v1/models`);
+    expect(response.status).toBe(401);
+    expect(response.headers.get("www-authenticate")).toContain("Bearer");
   });
 });

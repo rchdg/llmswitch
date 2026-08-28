@@ -52,6 +52,8 @@ export interface InboundRequest {
   stream: boolean;
   /** Responses-only: `type: "custom"` tool names that must round-trip. */
   customTools: Set<string>;
+  /** Legacy `/v1/completions`: responses are rendered as text completions. */
+  legacyCompletion?: boolean;
 }
 
 export function parseInboundRequest(
@@ -168,6 +170,101 @@ export function withRequestedModel(
   return payload;
 }
 
+// --- legacy text completions --------------------------------------------------
+
+/** Normalize `prompt` (string | string[]) into a single user message body. */
+export function legacyPromptToChatBody(
+  body: Record<string, unknown>,
+): Record<string, unknown> {
+  const prompt = body.prompt;
+  const text = Array.isArray(prompt)
+    ? prompt.map((item) => String(item)).join("\n")
+    : prompt === undefined || prompt === null
+      ? ""
+      : String(prompt);
+  const { prompt: _ignored, ...rest } = body;
+  return {
+    ...rest,
+    messages: [{ role: "user", content: text }],
+  };
+}
+
+function legacyText(chat: Record<string, unknown>): string {
+  const choices = chat.choices;
+  if (!Array.isArray(choices) || !choices.length) return "";
+  const message = (choices[0] as Record<string, unknown> | undefined)?.message;
+  const content = (message as Record<string, unknown> | undefined)?.content;
+  return typeof content === "string" ? content : "";
+}
+
+function legacyFinishReason(chat: Record<string, unknown>): string | null {
+  const choices = chat.choices;
+  if (!Array.isArray(choices) || !choices.length) return null;
+  const reason = (choices[0] as Record<string, unknown> | undefined)
+    ?.finish_reason;
+  return typeof reason === "string" ? reason : null;
+}
+
+/** Hub chat completion → legacy `text_completion` payload. */
+export function chatCompletionToLegacyCompletion(
+  chat: Record<string, unknown>,
+  requestedModel: string,
+): Record<string, unknown> {
+  return withRequestedModel(
+    {
+      id: typeof chat.id === "string" ? chat.id : "cmpl-gateway",
+      object: "text_completion",
+      created:
+        typeof chat.created === "number" ? chat.created : Math.floor(Date.now() / 1000),
+      model: requestedModel,
+      choices: [
+        {
+          index: 0,
+          text: legacyText(chat),
+          logprobs: null,
+          finish_reason: legacyFinishReason(chat),
+        },
+      ],
+      ...(chat.usage ? { usage: chat.usage } : {}),
+    },
+    requestedModel,
+  );
+}
+
+/** Hub chat chunk → legacy `text_completion.chunk` payload. */
+export function chatChunkToLegacyChunk(
+  chunk: Record<string, unknown>,
+  requestedModel: string,
+): Record<string, unknown> {
+  const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+  const first = (choices[0] as Record<string, unknown> | undefined) ?? {};
+  const delta = (first.delta as Record<string, unknown> | undefined) ?? {};
+  const text = typeof delta.content === "string" ? delta.content : "";
+  return withRequestedModel(
+    {
+      id: typeof chunk.id === "string" ? chunk.id : "cmpl-gateway",
+      object: "text_completion.chunk",
+      created:
+        typeof chunk.created === "number"
+          ? chunk.created
+          : Math.floor(Date.now() / 1000),
+      model: requestedModel,
+      choices: [
+        {
+          index: 0,
+          text,
+          logprobs: null,
+          finish_reason:
+            typeof first.finish_reason === "string"
+              ? first.finish_reason
+              : null,
+        },
+      ],
+    },
+    requestedModel,
+  );
+}
+
 // --- streaming --------------------------------------------------------------
 
 /** Decodes upstream SSE lines into hub Chat Completions chunks. */
@@ -231,6 +328,19 @@ export interface InboundStreamEncoder {
 export function createInboundEncoder(
   inbound: InboundRequest,
 ): InboundStreamEncoder {
+  if (inbound.format === "openai-chat" && inbound.legacyCompletion) {
+    return {
+      encode(chunk) {
+        return [
+          `data: ${JSON.stringify(chatChunkToLegacyChunk(chunk, inbound.requestedModel))}\n\n`,
+        ];
+      },
+      finish() {
+        return ["data: [DONE]\n\n"];
+      },
+    };
+  }
+
   if (inbound.format === "openai-chat") {
     return {
       encode(chunk) {

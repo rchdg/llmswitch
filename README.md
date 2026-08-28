@@ -183,17 +183,30 @@ curl http://127.0.0.1:17900/v1/messages \
   -d '{"model":"deepseek-chat","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
-**任意入口格式 ↔ 任意上游格式**。三种入口（OpenAI Chat、OpenAI Responses、Anthropic Messages）与三种上游格式可自由组合，含流式与工具调用；入口与上游格式相同时原样透传，避免无谓的转换损耗。
+**任意入口格式 ↔ 任意上游格式**。三种入口（OpenAI Chat、OpenAI Responses、Anthropic Messages）与三种上游格式可自由组合，含流式与工具调用；入口与上游格式相同时原样透传，避免无谓的转换损耗。已知限制：OpenAI Responses 的有状态特性（`previous_response_id`、`store`、后台模式）只在同格式透传时可用，跨格式转换不支持。
+
+上游地址默认拼 `/v1` 前缀；非标准路径的上游可自定义：
+
+```bash
+# 直连 baseUrl（如 Gemini OpenAI 兼容端点 …/v1beta/openai）
+llms gateway provider add --path-prefix ""
+# 自定义前缀
+llms gateway provider edit my-provider --path-prefix v2
+```
 
 | 端点 | 说明 |
 | --- | --- |
 | `GET /v1/models` | 可路由模型列表（按 Key 作用域过滤） |
+| `GET /v1/models/{id}` | 单个模型详情（OpenAI 客户端兼容） |
 | `POST /v1/chat/completions` | OpenAI Chat Completions |
+| `POST /v1/completions` | Legacy Text Completions（`prompt` 自动转为消息） |
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/messages/count_tokens` | Anthropic 上游走原生接口，其他上游本地计算（见下） |
 | `POST /v1/responses` | OpenAI Responses |
 | `POST /v1/embeddings` | 仅 OpenAI 兼容上游 |
 | `GET /health` | 存活探针（无需鉴权，不含任何配置信息） |
+
+每个响应都带 `x-request-id`（客户端可传入以关联日志），并转发到上游，方便全链路排查。
 
 **模型路由解析顺序**：
 
@@ -219,17 +232,35 @@ llms gateway resolve gpt-4o
 llms gateway config set --fallback true --max-attempts 3 --retry-statuses 429,500,502,503,504
 ```
 
-**API Key 管理**：仅存储哈希，支持吊销、过期与作用域限制。
+**熔断冷却**：连续失败的上游会进入指数退避冷却（5s 起，封顶 2 分钟），冷却期内路由直接跳过它；全部候选都在冷却时仍会照常尝试。`llms gateway status` 会显示当前冷却中的供应商。
+
+```bash
+# 测试供应商连通性（拉模型列表；--call 额外发一次 1-token 补全）
+llms gateway provider test my-provider --call
+
+# 从上游重新拉取模型列表
+llms gateway provider refresh-models my-provider
+
+# 自定义上游请求头（可重复传）
+llms gateway provider edit my-provider --header "X-Title: my-app"
+```
+
+**API Key 管理**：仅存储哈希，支持作用域、限额、过期、编辑与换发。
 
 ```bash
 # 限定供应商、模型、接口格式与速率
 llms gateway key create --name partner \
   --providers deepseek --models deepseek-chat \
-  --formats openai-chat --rate-limit 60 --expires-in-days 30
+  --formats openai-chat --rate-limit 60 --expires-in-days 30 \
+  --daily-requests 5000
 
 llms gateway key list
+llms gateway key edit <id> --rate-limit 120          # 改限额/作用域/续期
+llms gateway key rotate <id>                          # 换发明文，旧 Key 立即失效
 llms gateway key revoke <id>
 ```
+
+作用域说明：`--models` 按"客户端请求里的模型写法"匹配——限定别名就只用别名拼写访问，限定 `provider/model` 则两种写法都可；拼写错误在创建时会收到警告。
 
 **限流**：计数持久化在 `gateway/rate-limit.json`，重启不丢失，多个网关进程共享同一份计数。响应会带标准限流头，客户端可据此自行退避：
 
@@ -248,6 +279,8 @@ llms gateway config set --rate-limit 120
 llms gateway ratelimit show
 llms gateway ratelimit reset
 ```
+
+`--rate-limit` 的语义：`-1` 完全不限流（豁免全局默认），`0` 继承全局默认，`> 0` 硬上限；`--daily-requests` 额外提供按 UTC 日的请求配额。
 
 计数文件读写有锁保护；极端争用下拿不到锁时会放行请求而非阻塞流量，宁可限额略松也不卡住线上调用。
 
@@ -280,13 +313,42 @@ export LLM_SWITCH_DISABLE_TOKENIZER=1
 
 两档都会额外计入图片开销：从 base64 头部解析 PNG / JPEG / GIF / WebP 的真实像素尺寸，按 `宽 × 高 / 750` 折算；无法判定尺寸时（例如 URL 图片）按保守值计入。
 
+**用量统计**：网关按天记录每个（Key / 供应商 / 模型）组合的请求数与 token 用量，持久化在 `gateway/usage.json`（保留 90 天）：
+
+```bash
+llms gateway usage --days 7
+llms gateway usage --json
+llms gateway usage reset
+```
+
+**日志**：写入 `~/.config/llm-switch/gateway/gateway.log`，仅记录 Key 的 id，不记录明文或上游密钥；每行含 `req=<request-id>` 可与客户端和上游日志关联。启动时若超过 10MB 自动轮转为 `gateway.log.old`：
+
+```bash
+llms gateway logs              # 最后 100 行
+llms gateway logs --lines 500
+llms gateway logs --follow     # 持续跟踪
+```
+
+**运行时限额**（超时/并发/请求体大小）通过环境变量调整，与 Bridge 共用：
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `LLM_SWITCH_MAX_CONCURRENCY` | 16 | 最大并发请求数 |
+| `LLM_SWITCH_MAX_BODY_BYTES` | 16MB | 请求体上限 |
+| `LLM_SWITCH_MAX_RESPONSE_BYTES` | 32MB | 上游响应上限 |
+| `LLM_SWITCH_CONNECT_TIMEOUT_MS` | 30000 | 上游连接超时 |
+| `LLM_SWITCH_IDLE_TIMEOUT_MS` | 90000 | 流式空闲超时 |
+| `LLM_SWITCH_TOTAL_TIMEOUT_MS` | 600000 | 单请求总超时 |
+
+`llms gateway config show` 会一并显示当前生效值。
+
 **对外暴露的安全要求**：默认只绑回环地址。绑到非回环地址必须显式传 `--allow-remote`，且至少存在一个有效 API Key，否则拒绝启动。
 
 ```bash
 llms gateway start --host 0.0.0.0 --allow-remote
 ```
 
-网关只提供明文 HTTP，请放在反向代理（Nginx / Caddy）后面终止 TLS，不要把裸 HTTP 直接暴露到公网。浏览器直连需显式开启 CORS：
+网关只提供明文 HTTP，请放在反向代理（Nginx / Caddy）后面终止 TLS，不要把裸 HTTP 直接暴露到公网。浏览器直连需显式开启 CORS（已允许 `anthropic-beta` 等请求头，并暴露限流与 request-id 响应头）：
 
 ```bash
 llms gateway config set --cors-origins https://app.example.com
@@ -311,9 +373,13 @@ llms gateway config set --cors-origins https://app.example.com
 | `llms bridge status` | 查看 Bridge 状态 |
 | `llms gateway start` | 启动对外 AI 网关 |
 | `llms gateway provider import` | 从工具配置导入网关供应商 |
+| `llms gateway provider test <name>` | 测试供应商连通性 |
 | `llms gateway key create` | 创建网关 API Key |
+| `llms gateway key rotate <id>` | 换发 API Key |
 | `llms gateway status` | 查看网关状态 |
 | `llms gateway ratelimit show` | 查看各 Key 限流用量 |
+| `llms gateway usage` | 查看按天聚合的用量统计 |
+| `llms gateway logs` | 查看网关日志 |
 | `llms path` | 查看数据目录 |
 
 `<tool>` 可选 `claude`、`codex`、`opencode`。

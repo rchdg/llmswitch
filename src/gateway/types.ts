@@ -30,6 +30,12 @@ export interface GatewayProvider {
   /** Extra upstream headers; `authorization` here wins over apiKey. */
   headers?: Record<string, string>;
   proxy?: ProxyConfig;
+  /**
+   * Path segment joined between baseUrl and the API path (`/chat/completions`,
+   * `/messages`, ...). Defaults to `v1`; set to `""` to use baseUrl verbatim
+   * (e.g. Gemini's `…/v1beta/openai` endpoint).
+   */
+  pathPrefix?: string;
   /** Lower runs first during routing and fallback. */
   priority: number;
   enabled: boolean;
@@ -76,8 +82,13 @@ export interface GatewayKey {
   models: string[];
   /** Allowed inbound formats; empty or ["*"] means all. */
   formats: GatewayKeyScopeFormat[];
-  /** Per-key request cap; 0 disables the limit. */
+  /**
+   * Per-key request cap per minute: `> 0` enforces the cap, `0` inherits the
+   * gateway default, `-1` is explicitly unlimited.
+   */
   rateLimitPerMinute: number;
+  /** Per-key request quota per UTC day; 0 means no daily quota. */
+  requestsPerDay: number;
   lastUsedAt: string | null;
 }
 

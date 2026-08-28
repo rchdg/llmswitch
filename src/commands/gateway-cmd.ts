@@ -1,9 +1,30 @@
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import { cancel, confirm, isCancel, password, select, text } from "@clack/prompts";
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  readSync,
+  statSync,
+  watchFile,
+} from "node:fs";
 import { isApiFormat, type ApiFormat } from "../types.js";
 import { formatLabel } from "../formats/compatibility.js";
 import { detectApiFormat } from "../utils/detect-format.js";
 import { fetchModelList } from "../utils/fetch-models.js";
+import {
+  requestWithNodeTransport,
+} from "../bridge/transport.js";
+import { providerFormat } from "../gateway/types.js";
+import {
+  buildUpstreamHeaders,
+  upstreamUrl,
+} from "../gateway/server.js";
+import {
+  chatRequestToUpstream,
+  upstreamPath,
+} from "../gateway/pipeline.js";
 import {
   getGatewayLogPath,
   isGatewayAlive,
@@ -20,11 +41,16 @@ import {
   createGatewayKey,
   deleteGatewayKey,
   listGatewayKeys,
+  peekDailyQuota,
   peekRateLimit,
   publicKeyView,
   resetRateLimits,
   revokeGatewayKey,
+  rotateGatewayKey,
+  updateGatewayKey,
 } from "../gateway/keys.js";
+import { parseBridgeRuntimeLimits } from "../bridge/runtime.js";
+import { rotateGatewayLogIfNeeded } from "../gateway/manager.js";
 import {
   deleteGatewayProvider,
   deleteGatewayRoute,
@@ -38,7 +64,8 @@ import {
   saveGatewayRoute,
   writeGatewayConfig,
 } from "../gateway/store.js";
-import { listRoutableModels, resolveModelRoute } from "../gateway/router.js";
+import { listRoutableModelIds, listRoutableModels, resolveModelRoute } from "../gateway/router.js";
+import { resetUsage, summarizeUsage } from "../gateway/usage.js";
 import {
   DEFAULT_GATEWAY_HOST,
   DEFAULT_GATEWAY_PORT,
@@ -50,12 +77,37 @@ function bail(message: string): never {
   process.exit(1);
 }
 
+function formatDuration(totalSeconds: number): string {
+  const seconds = Math.max(0, Math.floor(totalSeconds));
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days) return `${days}天${hours}小时`;
+  if (hours) return `${hours}小时${minutes}分钟`;
+  if (minutes) return `${minutes}分钟`;
+  return `${seconds}秒`;
+}
+
 function splitList(value: string | undefined): string[] {
   if (!value) return [];
   return value
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+/** Parse a repeatable `--header "Name: value"` option. */
+function parseHeaderEntry(
+  value: string,
+  collected: Record<string, string>,
+): Record<string, string> {
+  const index = value.indexOf(":");
+  const name = index > 0 ? value.slice(0, index).trim() : "";
+  const headerValue = index > 0 ? value.slice(index + 1).trim() : "";
+  if (!name || !headerValue) {
+    bail(`无效的 --header「${value}」，格式应为 "名称: 值"`);
+  }
+  return { ...collected, [name]: headerValue };
 }
 
 function randomProviderName(): string {
@@ -80,6 +132,61 @@ export function registerGatewayCommand(program: Command): void {
   registerRouteCommands(gateway);
   registerConfigCommands(gateway);
   registerRateLimitCommands(gateway);
+  registerUsageCommands(gateway);
+  registerLogsCommands(gateway);
+}
+
+// --- logs -------------------------------------------------------------------
+
+function registerLogsCommands(gateway: Command): void {
+  gateway
+    .command("logs")
+    .description("查看网关日志（gateway.log）")
+    .option("--lines <n>", "显示最后 N 行（默认 100）", "100")
+    .option("--follow", "持续跟踪新日志（Ctrl+C 退出）")
+    .action((opts: { lines?: string; follow?: boolean }) => {
+      const lines = Number(opts.lines ?? "100");
+      if (!Number.isInteger(lines) || lines < 1 || lines > 10_000) {
+        bail("--lines 必须是 1..10000 的整数");
+      }
+      const path = getGatewayLogPath();
+      rotateGatewayLogIfNeeded();
+      if (!existsSync(path)) {
+        console.log("暂无日志文件。");
+        return;
+      }
+      const printTail = (): number => {
+        const raw = readFileSync(path, "utf8");
+        if (!raw) return 0;
+        const all = raw.split(/\r?\n/);
+        if (all.length && all[all.length - 1] === "") all.pop();
+        const tail = all.slice(Math.max(0, all.length - lines));
+        for (const line of tail) console.log(line);
+        return raw.length;
+      };
+      printTail();
+      if (!opts.follow) return;
+      console.log("── 正在跟踪日志，Ctrl+C 退出 ──");
+      let shown = statSync(path).size;
+      watchFile(path, { interval: 1_000 }, () => {
+        try {
+          const stat = statSync(path);
+          if (stat.size < shown) {
+            // Rotated or truncated: restart from the beginning.
+            shown = 0;
+          }
+          if (stat.size === shown) return;
+          const fd = openSync(path, "r");
+          const buffer = Buffer.alloc(stat.size - shown);
+          readSync(fd, buffer, 0, buffer.length, shown);
+          closeSync(fd);
+          shown = stat.size;
+          process.stdout.write(buffer.toString("utf8"));
+        } catch {
+          // File vanished mid-follow; retry on next tick.
+        }
+      });
+    });
 }
 
 // --- rate limits ------------------------------------------------------------
@@ -97,10 +204,15 @@ function registerRateLimitCommands(gateway: Command): void {
       const config = readGatewayConfig();
       const rows = listGatewayKeys().map((key) => {
         const limit =
-          key.rateLimitPerMinute > 0
-            ? key.rateLimitPerMinute
-            : config.rateLimitPerMinute;
+          key.rateLimitPerMinute === -1
+            ? 0
+            : key.rateLimitPerMinute > 0
+              ? key.rateLimitPerMinute
+              : config.rateLimitPerMinute;
         const snapshot = peekRateLimit(key.id, limit);
+        const daily = key.requestsPerDay
+          ? peekDailyQuota(key.id, key.requestsPerDay)
+          : null;
         return {
           id: key.id,
           name: key.name,
@@ -108,6 +220,10 @@ function registerRateLimitCommands(gateway: Command): void {
           remaining: snapshot.remaining,
           resetAt: snapshot.resetAt
             ? new Date(snapshot.resetAt * 1000).toISOString()
+            : null,
+          unlimited: key.rateLimitPerMinute === -1,
+          daily: daily
+            ? { limit: daily.limit, remaining: daily.remaining }
             : null,
         };
       });
@@ -120,12 +236,19 @@ function registerRateLimitCommands(gateway: Command): void {
         return;
       }
       for (const row of rows) {
-        if (row.limit <= 0) {
+        if (row.unlimited) {
           console.log(`${row.id} ${row.name}：不限流`);
           continue;
         }
+        if (row.limit <= 0) {
+          console.log(`${row.id} ${row.name}：不限流（未设置限额）`);
+          continue;
+        }
+        const daily = row.daily
+          ? `，今日剩余 ${row.daily.remaining}/${row.daily.limit}`
+          : "";
         console.log(
-          `${row.id} ${row.name}：剩余 ${row.remaining}/${row.limit}，窗口重置于 ${row.resetAt}`,
+          `${row.id} ${row.name}：剩余 ${row.remaining}/${row.limit}，窗口重置于 ${row.resetAt}${daily}`,
         );
       }
     });
@@ -136,6 +259,52 @@ function registerRateLimitCommands(gateway: Command): void {
     .action(() => {
       resetRateLimits();
       console.log("已清空限流计数");
+    });
+}
+
+// --- usage ------------------------------------------------------------------
+
+function registerUsageCommands(gateway: Command): void {
+  const usage = gateway
+    .command("usage")
+    .description("查看按天聚合的用量统计（Key / 供应商 / 模型）");
+
+  usage
+    .command("show", { isDefault: true })
+    .description("显示最近 N 天的用量")
+    .option("--days <n>", "统计最近几天的数据（默认 7）", "7")
+    .option("--json", "JSON 输出")
+    .action((opts: { days?: string; json?: boolean }) => {
+      const days = Number(opts.days ?? "7");
+      if (!Number.isInteger(days) || days < 1 || days > 90) {
+        bail("--days 必须是 1..90 的整数");
+      }
+      const rows = summarizeUsage({ days });
+      if (opts.json) {
+        console.log(JSON.stringify(rows, null, 2));
+        return;
+      }
+      if (!rows.length) {
+        console.log(`最近 ${days} 天暂无用量记录。`);
+        return;
+      }
+      console.log(`统计范围：最近 ${days} 天\n`);
+      console.log(
+        "日期        请求数  输入tokens  输出tokens  Key      供应商        模型",
+      );
+      for (const row of rows) {
+        console.log(
+          `${row.day}  ${String(row.requests).padStart(5)}  ${String(row.inputTokens).padStart(10)}  ${String(row.outputTokens).padStart(10)}  ${row.key.padEnd(8)} ${row.provider.padEnd(12)} ${row.model}`,
+        );
+      }
+    });
+
+  usage
+    .command("reset")
+    .description("清空所有用量记录")
+    .action(() => {
+      resetUsage();
+      console.log("已清空用量记录");
     });
 }
 
@@ -188,7 +357,11 @@ function registerServerCommands(gateway: Command): void {
             `网关启动失败。查看日志：${getGatewayLogPath()}，或前台运行：llms gateway serve`,
           );
         }
-        console.log(`网关已启动 pid=${pid} ${gatewayRootUrl()}`);
+        if (pid > 0) {
+          console.log(`网关已启动 pid=${pid} ${gatewayRootUrl()}`);
+        } else {
+          console.log(`网关已在运行 ${gatewayRootUrl()}`);
+        }
         console.log(`OpenAI base：${gatewayBaseUrl()}`);
       },
     );
@@ -228,12 +401,22 @@ function registerServerCommands(gateway: Command): void {
         routes: listGatewayRoutes(),
         keys,
         config: readGatewayConfig(),
+        breakers: probe.breakers ?? [],
       };
       if (opts.json) {
         console.log(JSON.stringify(data, null, 2));
         return;
       }
       console.log(`状态：${data.alive ? "运行中" : data.reachable ? "端口被占用（非本网关）" : "未运行"}`);
+      if (data.alive && probe.uptimeSeconds !== undefined) {
+        console.log(`已运行：${formatDuration(probe.uptimeSeconds)}`);
+      }
+      if (data.alive && probe.stats) {
+        const stats = probe.stats;
+        console.log(
+          `请求：共 ${stats.requests} 次（4xx ${stats.errors4xx}，5xx ${stats.errors5xx}），并发 ${stats.activeConnections}/${stats.maxConcurrency}`,
+        );
+      }
       console.log(`监听：${data.listener.bindHost}:${data.listener.port}${data.listener.allowRemote ? "（已对外暴露）" : "（仅本机）"}`);
       console.log(`OpenAI base：${data.openaiBaseUrl}`);
       console.log(`Anthropic base：${data.anthropicBaseUrl}`);
@@ -246,6 +429,12 @@ function registerServerCommands(gateway: Command): void {
         `API Key：${keys.length} 个（有效 ${keys.filter((k) => k.status === "active").length} 个）`,
       );
       console.log(`模型路由：${data.routes.length} 条`);
+      const cooling = data.breakers.filter((row) => row.coolingMsRemaining > 0);
+      for (const row of cooling) {
+        console.log(
+          `熔断冷却：${row.provider}（连续失败 ${row.consecutiveFailures} 次，剩余 ${Math.ceil(row.coolingMsRemaining / 1000)}s，最近错误：${row.lastError || "未知"}）`,
+        );
+      }
       if (!keys.some((key) => key.status === "active")) {
         console.log("提示：尚无有效 API Key，请执行 llms gateway key create");
       }
@@ -323,7 +512,7 @@ function registerProviderCommands(gateway: Command): void {
       }
       for (const item of providers) {
         console.log(
-          `${item.enabled ? "●" : "○"} ${item.name}（${item.displayName}） ${item.apiFormat} ${item.baseUrl} key=${item.apiKey} priority=${item.priority} models=${item.models.length}`,
+          `${item.enabled ? "●" : "○"} ${item.name}（${item.displayName}） ${item.apiFormat} ${item.baseUrl} key=${item.apiKey} priority=${item.priority} models=${item.models.length}${item.pathPrefix && item.pathPrefix !== "v1" ? ` path=${item.pathPrefix || "(直连)"}` : ""}${item.headerNames?.length ? ` headers=${item.headerNames.join("/")}` : ""}`,
         );
       }
     });
@@ -342,7 +531,18 @@ function registerProviderCommands(gateway: Command): void {
     .option("--models <list>", "逗号分隔的模型列表（缺省尝试自动获取）")
     .option("--priority <n>", "优先级，越小越先被选中", "100")
     .option("--proxy <url>", "上游代理 URL")
-    .action(async (opts: Record<string, string | undefined>) => {
+    .option(
+      "--path-prefix <prefix>",
+      "baseUrl 与 API 路径之间的前缀，默认 v1；传空字符串表示直连 baseUrl（如 Gemini 兼容端点）",
+    )
+    .addOption(
+      new Option("--header <value>", '自定义上游请求头，格式 "名称: 值"，可重复传入')
+        .argParser((value: string, previous: Record<string, string>) =>
+          parseHeaderEntry(value, previous ?? {}),
+        )
+        .default({}),
+    )
+    .action(async (opts: Record<string, string | undefined> & { header?: Record<string, string> }) => {
       const baseUrl = opts.baseUrl ?? (await promptText("API 地址（base URL）"));
       if (!baseUrl) bail("已取消");
       const apiKey =
@@ -393,8 +593,11 @@ function registerProviderCommands(gateway: Command): void {
         baseUrl,
         apiKey: apiKey || "",
         models,
-        headers: {},
+        headers: opts.header ?? {},
         proxy: opts.proxy,
+        ...(opts.pathPrefix !== undefined
+          ? { pathPrefix: opts.pathPrefix }
+          : {}),
         priority: Number.isFinite(priority) ? priority : 100,
         enabled: true,
         sourceProfile: null,
@@ -427,6 +630,125 @@ function registerProviderCommands(gateway: Command): void {
     });
 
   provider
+    .command("test")
+    .description("测试供应商连通性：拉取模型列表，可选发送一次最小补全请求")
+    .argument("<name>", "供应商名称")
+    .option("--model <id>", "用于 --call 的模型 id（缺省取模型列表第一个）")
+    .option("--call", "额外发送一次 1-token 补全请求验证推理可用")
+    .option("--json", "JSON 输出")
+    .action(async (name: string, opts: { model?: string; call?: boolean; json?: boolean }) => {
+      const provider = requireGatewayProvider(name);
+      const result: Record<string, unknown> = { provider: provider.name };
+
+      const startedAt = Date.now();
+      try {
+        const fetched = await fetchModelList({
+          baseUrl: provider.baseUrl,
+          apiKey: provider.apiKey,
+          apiFormat: provider.apiFormat,
+          proxy: provider.proxy,
+          headers: provider.headers,
+        });
+        result.modelsEndpoint = { ok: true, count: fetched.models.length, endpoint: fetched.endpoint };
+        result.modelsLatencyMs = Date.now() - startedAt;
+        result.models = fetched.models.slice(0, 10);
+        if (fetched.models.length > 10) result.modelsTruncated = true;
+      } catch (err) {
+        result.modelsEndpoint = {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+
+      if (opts.call) {
+        const model = opts.model || provider.models[0] || (result.models as string[] | undefined)?.[0];
+        if (!model) {
+          result.completion = { ok: false, error: "没有可用模型 id；请用 --model 指定" };
+        } else {
+          const targetFormat = providerFormat(provider);
+          const hub: Record<string, unknown> = {
+            model,
+            messages: [{ role: "user", content: "ping" }],
+            max_tokens: 1,
+          };
+          const callStarted = Date.now();
+          try {
+            const response = await requestWithNodeTransport({
+              url: upstreamUrl(provider, upstreamPath(targetFormat)),
+              method: "POST",
+              headers: buildUpstreamHeaders(provider),
+              body: JSON.stringify(chatRequestToUpstream(targetFormat, hub)),
+              proxy: provider.proxy,
+              signal: AbortSignal.timeout(30_000),
+              totalTimeoutMs: 30_000,
+            });
+            const text = await response.text().catch(() => "");
+            result.completion = {
+              ok: response.ok,
+              status: response.status,
+              latencyMs: Date.now() - callStarted,
+              model,
+              ...(response.ok
+                ? { body: text.slice(0, 300) }
+                : { error: text.slice(0, 300) }),
+            };
+          } catch (err) {
+            result.completion = {
+              ok: false,
+              latencyMs: Date.now() - callStarted,
+              model,
+              error: err instanceof Error ? err.message : String(err),
+            };
+          }
+        }
+      }
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      const models = result.modelsEndpoint as { ok: boolean; count?: number; error?: string };
+      if (models?.ok) {
+        console.log(`模型列表：OK（${models.count} 个，${result.modelsLatencyMs}ms）`);
+      } else {
+        console.log(`模型列表：失败 — ${models?.error ?? "未知错误"}`);
+      }
+      const completion = result.completion as { ok?: boolean; status?: number; latencyMs?: number; error?: string } | undefined;
+      if (completion) {
+        if (completion.ok) {
+          console.log(`补全请求：OK（HTTP ${completion.status}，${completion.latencyMs}ms）`);
+        } else {
+          console.log(`补全请求：失败 — ${completion.error ?? `HTTP ${completion.status}`}`);
+        }
+      }
+      const allOk = models?.ok && (!completion || completion.ok);
+      if (!allOk) process.exitCode = 1;
+    });
+
+  provider
+    .command("refresh-models")
+    .description("从上游重新拉取模型列表并覆盖本地缓存")
+    .argument("<name>", "供应商名称")
+    .action(async (name: string) => {
+      const provider = requireGatewayProvider(name);
+      const fetched = await fetchModelList({
+        baseUrl: provider.baseUrl,
+        apiKey: provider.apiKey,
+        apiFormat: provider.apiFormat,
+        proxy: provider.proxy,
+        headers: provider.headers,
+      });
+      if (!fetched.models.length) {
+        console.log("上游返回空列表，未做修改。");
+        return;
+      }
+      const saved = saveGatewayProvider({ ...provider, models: fetched.models });
+      console.log(`已更新 ${saved.name} 的模型列表（${saved.models.length} 个）`);
+      for (const model of saved.models.slice(0, 20)) console.log(`  - ${model}`);
+      if (saved.models.length > 20) console.log(`  … 共 ${saved.models.length} 个`);
+    });
+
+  provider
     .command("edit")
     .description("修改供应商字段")
     .argument("<name>", "供应商名称")
@@ -437,7 +759,19 @@ function registerProviderCommands(gateway: Command): void {
     .option("--models <list>", "逗号分隔的模型列表（覆盖）")
     .option("--priority <n>", "优先级")
     .option("--proxy <url>", "上游代理 URL（传空字符串清除）")
-    .action((name: string, opts: Record<string, string | undefined>) => {
+    .option(
+      "--path-prefix <prefix>",
+      "baseUrl 与 API 路径之间的前缀，默认 v1；传空字符串表示直连 baseUrl",
+    )
+    .option("--clear-headers", "清除已配置的自定义请求头")
+    .addOption(
+      new Option("--header <value>", '自定义上游请求头，格式 "名称: 值"，可重复传入（合并进现有配置）')
+        .argParser((value: string, previous: Record<string, string>) =>
+          parseHeaderEntry(value, previous ?? {}),
+        )
+        .default({}),
+    )
+    .action((name: string, opts: Record<string, string | undefined> & { header?: Record<string, string>; clearHeaders?: boolean }) => {
       const current = requireGatewayProvider(name);
       const next: GatewayProvider = { ...current };
       if (opts.displayName) next.displayName = opts.displayName;
@@ -455,6 +789,15 @@ function registerProviderCommands(gateway: Command): void {
       }
       if (opts.proxy !== undefined) {
         next.proxy = opts.proxy.trim() ? opts.proxy.trim() : undefined;
+      }
+      if (opts.pathPrefix !== undefined) {
+        next.pathPrefix = opts.pathPrefix.trim() ? opts.pathPrefix : "";
+      }
+      if (opts.clearHeaders) {
+        next.headers = {};
+      }
+      if (opts.header && Object.keys(opts.header).length) {
+        next.headers = { ...next.headers, ...opts.header };
       }
       const saved = saveGatewayProvider(next);
       console.log(`已更新供应商 ${saved.name}`);
@@ -526,7 +869,9 @@ function registerKeyCommands(gateway: Command): void {
         if (item.providers.length) scopes.push(`providers=${item.providers.join("/")}`);
         if (item.models.length) scopes.push(`models=${item.models.join("/")}`);
         if (!item.formats.includes("*")) scopes.push(`formats=${item.formats.join("/")}`);
-        if (item.rateLimitPerMinute) scopes.push(`rpm=${item.rateLimitPerMinute}`);
+        if (item.rateLimitPerMinute === -1) scopes.push("rpm=unlimited");
+        else if (item.rateLimitPerMinute > 0) scopes.push(`rpm=${item.rateLimitPerMinute}`);
+        if (item.requestsPerDay) scopes.push(`daily=${item.requestsPerDay}`);
         console.log(
           `${item.status === "active" ? "●" : "○"} ${item.id} ${item.name} ${item.hint} ${item.status}${item.expiresAt ? ` 过期=${item.expiresAt}` : ""}${scopes.length ? ` [${scopes.join(" ")}]` : ""}`,
         );
@@ -544,15 +889,45 @@ function registerKeyCommands(gateway: Command): void {
       "--formats <list>",
       "限定可用接口格式：openai-chat,anthropic,openai-responses",
     )
-    .option("--rate-limit <rpm>", "该 Key 每分钟请求上限（0 表示不限）")
+    .option(
+      "--rate-limit <rpm>",
+      "该 Key 每分钟请求上限；-1 表示完全不限流，0 表示继承全局默认",
+    )
+    .option("--daily-requests <n>", "该 Key 每日请求配额（UTC 日重置，0 表示不限）")
     .action((opts: Record<string, string | undefined>) => {
       const days = opts.expiresInDays ? Number(opts.expiresInDays) : 0;
       if (opts.expiresInDays && !Number.isFinite(days)) {
         bail("--expires-in-days 必须是数字");
       }
-      const rateLimit = opts.rateLimit ? Number(opts.rateLimit) : 0;
-      if (opts.rateLimit && !Number.isFinite(rateLimit)) {
+      const rateLimitRaw = opts.rateLimit ? Number(opts.rateLimit) : 0;
+      if (opts.rateLimit && !Number.isFinite(rateLimitRaw)) {
         bail("--rate-limit 必须是数字");
+      }
+      const dailyRaw = opts.dailyRequests ? Number(opts.dailyRequests) : 0;
+      if (opts.dailyRequests && (!Number.isInteger(dailyRaw) || dailyRaw < 0)) {
+        bail("--daily-requests 必须是非负整数");
+      }
+      // Typos in scope lists fail closed (all requests denied) and are hard to
+      // diagnose later, so flag anything unknown at creation time.
+      const knownProviders = new Set(
+        listGatewayProviders().map((p) => p.name.toLowerCase()),
+      );
+      for (const name of splitList(opts.providers)) {
+        if (!knownProviders.has(name.toLowerCase())) {
+          console.warn(
+            `警告：供应商「${name}」不存在，限定该供应商的请求将全部被拒绝。`,
+          );
+        }
+      }
+      const routable = new Set(
+        listRoutableModelIds().map((m) => m.toLowerCase()),
+      );
+      for (const model of splitList(opts.models)) {
+        if (!routable.has(model.toLowerCase())) {
+          console.warn(
+            `警告：模型「${model}」当前不在可路由列表中（passthrough 上游仍可能接受它）。`,
+          );
+        }
       }
       const created = createGatewayKey({
         name: opts.name,
@@ -560,7 +935,8 @@ function registerKeyCommands(gateway: Command): void {
         providers: splitList(opts.providers),
         models: splitList(opts.models),
         formats: splitList(opts.formats),
-        rateLimitPerMinute: rateLimit,
+        rateLimitPerMinute: Math.trunc(rateLimitRaw),
+        requestsPerDay: opts.dailyRequests ? Number(opts.dailyRequests) : 0,
       });
       console.log("已创建 API Key。请立即保存，明文不会再次显示：");
       console.log("");
@@ -569,6 +945,70 @@ function registerKeyCommands(gateway: Command): void {
       console.log(`id=${created.key.id} name=${created.key.name}`);
       console.log(`OpenAI base：${gatewayBaseUrl()}`);
       console.log(`Anthropic base：${gatewayRootUrl()}`);
+    });
+
+  key
+    .command("edit")
+    .description("修改 API Key 的作用域、限额或有效期")
+    .argument("<idOrName>", "Key id 或名称")
+    .option("--name <name>", "备注名称")
+    .option("--providers <list>", "限定可用供应商，逗号分隔（覆盖）")
+    .option("--models <list>", "限定可用模型，逗号分隔（覆盖）")
+    .option(
+      "--formats <list>",
+      "限定可用接口格式：openai-chat,anthropic,openai-responses（覆盖）",
+    )
+    .option(
+      "--rate-limit <rpm>",
+      "每分钟请求上限；-1 表示完全不限流，0 表示继承全局默认",
+    )
+    .option(
+      "--expires-in-days <n>",
+      "新的有效期天数（从现在起算）；0 表示永不过期",
+    )
+    .action((idOrName: string, opts: Record<string, string | undefined>) => {
+      const patch: Record<string, unknown> = {};
+      if (opts.name !== undefined) patch.name = opts.name;
+      if (opts.providers !== undefined) patch.providers = splitList(opts.providers);
+      if (opts.models !== undefined) patch.models = splitList(opts.models);
+      if (opts.formats !== undefined) patch.formats = splitList(opts.formats);
+      if (opts.rateLimit !== undefined) {
+        const value = Number(opts.rateLimit);
+        if (!Number.isFinite(value)) bail("--rate-limit 必须是数字");
+        patch.rateLimitPerMinute = Math.trunc(value);
+      }
+      if (opts.dailyRequests !== undefined) {
+        const value = Number(opts.dailyRequests);
+        if (!Number.isInteger(value) || value < 0) {
+          bail("--daily-requests 必须是非负整数");
+        }
+        patch.requestsPerDay = value;
+      }
+      if (opts.expiresInDays !== undefined) {
+        const value = Number(opts.expiresInDays);
+        if (!Number.isFinite(value) || value < 0) {
+          bail("--expires-in-days 必须是非负数字");
+        }
+        patch.expiresInDays = value;
+      }
+      if (!Object.keys(patch).length) {
+        bail("没有指定任何修改项；可用 --name/--providers/--models/--formats/--rate-limit/--expires-in-days");
+      }
+      const updated = updateGatewayKey(idOrName, patch);
+      console.log(`已更新 ${updated.id}（${updated.name}）`);
+      console.log(JSON.stringify(publicKeyView(updated), null, 2));
+    });
+
+  key
+    .command("rotate")
+    .description("换发 API Key（保留作用域，旧明文立即失效，新明文只显示一次）")
+    .argument("<idOrName>", "Key id 或名称")
+    .action((idOrName: string) => {
+      const rotated = rotateGatewayKey(idOrName);
+      console.log(`已换发 ${rotated.key.id}（${rotated.key.name}）。请立即保存新明文，不会再次显示：`);
+      console.log("");
+      console.log(`  ${rotated.plaintext}`);
+      console.log("");
     });
 
   key
@@ -683,9 +1123,11 @@ function registerConfigCommands(gateway: Command): void {
 
   config
     .command("show", { isDefault: true })
-    .description("显示当前配置")
+    .description("显示当前配置与生效的运行时限额")
     .action(() => {
-      console.log(JSON.stringify(readGatewayConfig(), null, 2));
+      const config = readGatewayConfig();
+      const limits = parseBridgeRuntimeLimits();
+      console.log(JSON.stringify({ config, runtimeLimits: limits }, null, 2));
     });
 
   config

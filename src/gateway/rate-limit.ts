@@ -21,6 +21,7 @@ import { atomicWriteFile, ensureDir } from "../utils/fs.js";
 import { getGatewayDir } from "../utils/paths.js";
 
 const WINDOW_MS = 60_000;
+const DAY_MS = 86_400_000;
 const LOCK_TIMEOUT_MS = 500;
 const LOCK_STALE_MS = 5_000;
 const LOCK_SPIN_MS = 2;
@@ -195,7 +196,8 @@ function writeWindows(windows: WindowMap, now: number): void {
   // Drop windows that can no longer affect a decision.
   const pruned: WindowMap = {};
   for (const [key, record] of Object.entries(windows)) {
-    if (now - record.windowStart < WINDOW_MS * 2) pruned[key] = record;
+    const span = key.endsWith("#day") ? DAY_MS * 2 : WINDOW_MS * 2;
+    if (now - record.windowStart < span) pruned[key] = record;
   }
   ensureDir(getGatewayDir());
   atomicWriteFile(
@@ -210,12 +212,13 @@ const memoryWindows = new Map<string, WindowRecord>();
 function decide(
   record: WindowRecord | undefined,
   limit: number,
+  windowMs: number,
   now: number,
 ): { next: WindowRecord; decision: RateLimitDecision } {
-  const fresh = !record || now - record.windowStart >= WINDOW_MS;
+  const fresh = !record || now - record.windowStart >= windowMs;
   const windowStart = fresh ? now : record!.windowStart;
   const used = fresh ? 0 : record!.count;
-  const resetAt = Math.ceil((windowStart + WINDOW_MS) / 1000);
+  const resetAt = Math.ceil((windowStart + windowMs) / 1000);
 
   if (used >= limit) {
     return {
@@ -227,7 +230,7 @@ function decide(
         resetAt,
         retryAfterSeconds: Math.max(
           1,
-          Math.ceil((windowStart + WINDOW_MS - now) / 1000),
+          Math.ceil((windowStart + windowMs - now) / 1000),
         ),
       },
     };
@@ -255,52 +258,7 @@ export function checkRateLimit(
   limitPerMinute: number,
   now = Date.now(),
 ): RateLimitDecision {
-  if (!limitPerMinute || limitPerMinute <= 0) return { ...UNLIMITED };
-
-  const lock = acquireLock(now);
-  if (!lock) {
-    const { next, decision } = decide(
-      memoryWindows.get(keyId),
-      limitPerMinute,
-      now,
-    );
-    memoryWindows.set(keyId, next);
-    return decision;
-  }
-
-  try {
-    const windows = readWindows();
-    const { next, decision } = decide(windows[keyId], limitPerMinute, now);
-    windows[keyId] = next;
-    memoryWindows.set(keyId, next);
-    writeWindows(windows, now);
-    return decision;
-  } catch {
-    // Never fail a request because bookkeeping failed.
-    return { ...UNLIMITED, limit: limitPerMinute };
-  } finally {
-    lock.release();
-  }
-}
-
-/** Read the current window without consuming a slot. */
-export function peekRateLimit(
-  keyId: string,
-  limitPerMinute: number,
-  now = Date.now(),
-): RateLimitDecision {
-  if (!limitPerMinute || limitPerMinute <= 0) return { ...UNLIMITED };
-  const record = readWindows()[keyId] ?? memoryWindows.get(keyId);
-  const fresh = !record || now - record.windowStart >= WINDOW_MS;
-  const windowStart = fresh ? now : record!.windowStart;
-  const used = fresh ? 0 : record!.count;
-  return {
-    allowed: used < limitPerMinute,
-    limit: limitPerMinute,
-    remaining: Math.max(0, limitPerMinute - used),
-    resetAt: Math.ceil((windowStart + WINDOW_MS) / 1000),
-    retryAfterSeconds: 0,
-  };
+  return checkWindow(keyId, limitPerMinute, WINDOW_MS, now);
 }
 
 /** Clear all counters (test seam and `llms gateway ratelimit reset`). */
@@ -312,4 +270,84 @@ export function resetRateLimits(): void {
   } catch {
     // Nothing persisted yet.
   }
+}
+
+/**
+ * Consume one request slot from the UTC-day window for `keyId`. A limit of 0
+ * or less means no daily quota and records nothing.
+ */
+export function checkDailyQuota(
+  keyId: string,
+  limitPerDay: number,
+  now = Date.now(),
+): RateLimitDecision {
+  return checkWindow(`${keyId}#day`, limitPerDay, DAY_MS, now);
+}
+
+/** Read the daily window without consuming a slot. */
+export function peekDailyQuota(
+  keyId: string,
+  limitPerDay: number,
+  now = Date.now(),
+): RateLimitDecision {
+  return peekWindow(`${keyId}#day`, limitPerDay, DAY_MS, now);
+}
+
+function checkWindow(
+  bucket: string,
+  limit: number,
+  windowMs: number,
+  now: number,
+): RateLimitDecision {
+  if (!limit || limit <= 0) return { ...UNLIMITED };
+
+  const lock = acquireLock(now);
+  if (!lock) {
+    const { next, decision } = decide(memoryWindows.get(bucket), limit, windowMs, now);
+    memoryWindows.set(bucket, next);
+    return decision;
+  }
+
+  try {
+    const windows = readWindows();
+    const { next, decision } = decide(windows[bucket], limit, windowMs, now);
+    windows[bucket] = next;
+    memoryWindows.set(bucket, next);
+    writeWindows(windows, now);
+    return decision;
+  } catch {
+    // Never fail a request because bookkeeping failed.
+    return { ...UNLIMITED, limit };
+  } finally {
+    lock.release();
+  }
+}
+
+/** Read the current window without consuming a slot. */
+export function peekRateLimit(
+  keyId: string,
+  limitPerMinute: number,
+  now = Date.now(),
+): RateLimitDecision {
+  return peekWindow(keyId, limitPerMinute, WINDOW_MS, now);
+}
+
+function peekWindow(
+  bucket: string,
+  limit: number,
+  windowMs: number,
+  now: number,
+): RateLimitDecision {
+  if (!limit || limit <= 0) return { ...UNLIMITED };
+  const record = readWindows()[bucket] ?? memoryWindows.get(bucket);
+  const fresh = !record || now - record.windowStart >= windowMs;
+  const windowStart = fresh ? now : record!.windowStart;
+  const used = fresh ? 0 : record!.count;
+  return {
+    allowed: used < limit,
+    limit,
+    remaining: Math.max(0, limit - used),
+    resetAt: Math.ceil((windowStart + windowMs) / 1000),
+    retryAfterSeconds: 0,
+  };
 }

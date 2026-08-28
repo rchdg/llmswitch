@@ -14,6 +14,7 @@ import {
   type ServerResponse,
 } from "node:http";
 import { parseBridgeRuntimeLimits } from "../bridge/runtime.js";
+import { randomBytes } from "node:crypto";
 import {
   requestWithNodeTransport,
   type NodeTransportResponse,
@@ -30,9 +31,11 @@ import {
   createInboundEncoder,
   createUpstreamDecoder,
   chatCompletionToInbound,
+  chatCompletionToLegacyCompletion,
   chatRequestToUpstream,
   formatErrorBody,
   inboundToChatRequest,
+  legacyPromptToChatBody,
   parseInboundRequest,
   translateUpstreamError,
   upstreamPath,
@@ -52,7 +55,9 @@ import {
   readGatewayConfig,
 } from "./store.js";
 import { constantTimeTokenEqual, readGatewayState } from "./state.js";
+import { ProviderBreaker } from "./health.js";
 import { countAnthropicInputTokens } from "./tokens.js";
+import { recordUsage } from "./usage.js";
 import {
   providerFormat,
   type GatewayConfig,
@@ -89,6 +94,23 @@ function headerValue(
   value: string | string[] | undefined,
 ): string | undefined {
   return Array.isArray(value) ? value[0] : value;
+}
+
+const REQUEST_ID_SOURCE = Symbol("llm-switch-request-id");
+const REQUEST_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
+
+/** Echo a client-supplied id or mint a fresh one for correlation. */
+function requestIdOf(req: IncomingMessage): string {
+  const bag = req as unknown as Record<symbol, unknown>;
+  const existing = bag[REQUEST_ID_SOURCE];
+  if (typeof existing === "string") return existing;
+  const supplied = headerValue(req.headers["x-request-id"]);
+  const id =
+    supplied && REQUEST_ID_RE.test(supplied)
+      ? supplied
+      : randomBytes(8).toString("hex");
+  bag[REQUEST_ID_SOURCE] = id;
+  return id;
 }
 
 /** Accept both OpenAI (`Authorization: Bearer`) and Anthropic (`x-api-key`). */
@@ -168,19 +190,33 @@ function sendJson(
   res.end(raw);
 }
 
-/** Join a provider base URL with an API path, tolerating a `/v1` suffix. */
+/** Join a provider base URL with an API path, honoring its path prefix. */
 export function upstreamUrl(provider: GatewayProvider, path: string): string {
   const base = provider.baseUrl.replace(/\/+$/, "");
   const suffix = path.startsWith("/") ? path : `/${path}`;
-  if (/\/v1$/i.test(base)) return `${base}${suffix}`;
-  return `${base}/v1${suffix}`;
+  const prefix = (provider.pathPrefix ?? "v1").replace(/^\/+|\/+$/g, "");
+  if (!prefix) return `${base}${suffix}`;
+  if (base.endsWith(`/${prefix}`)) return `${base}${suffix}`;
+  return `${base}/${prefix}${suffix}`;
 }
 
 const HOP_BY_HOP =
   /^(connection|keep-alive|proxy-authenticate|proxy-authorization|te|trailer|transfer-encoding|upgrade|host|content-length)$/i;
 
+/**
+ * Client headers worth relaying on a format-preserving pass-through, so beta
+ * programs (`anthropic-beta`, `openai-beta`) keep working through the gateway.
+ * Provider-configured headers always win.
+ */
+const FORWARDED_CLIENT_HEADERS = [
+  "anthropic-version",
+  "anthropic-beta",
+  "openai-beta",
+] as const;
+
 export function buildUpstreamHeaders(
   provider: GatewayProvider,
+  req?: IncomingMessage,
 ): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: "application/json",
@@ -195,6 +231,9 @@ export function buildUpstreamHeaders(
   }
 
   let hasAuthorization = Boolean(headers.Authorization);
+  const providerHeaderNames = new Set(
+    Object.keys(provider.headers || {}).map((name) => name.toLowerCase()),
+  );
   for (const [name, value] of Object.entries(provider.headers || {})) {
     if (HOP_BY_HOP.test(name)) continue;
     headers[name] = value;
@@ -207,6 +246,16 @@ export function buildUpstreamHeaders(
     );
     if (explicit) headers.Authorization = provider.headers![explicit]!;
   }
+
+  if (req) {
+    for (const name of FORWARDED_CLIENT_HEADERS) {
+      if (providerHeaderNames.has(name)) continue;
+      const value = headerValue(req.headers[name]);
+      if (value !== undefined) headers[name] = value;
+    }
+    // Correlate upstream calls with the gateway request id.
+    headers["x-request-id"] = requestIdOf(req);
+  }
   return headers;
 }
 
@@ -214,6 +263,33 @@ interface AttemptFailure {
   candidate: RouteCandidate;
   status: number;
   message: string;
+}
+
+/**
+ * Tolerant token-usage extraction: upstream payloads and hub chunks speak
+ * either the OpenAI or the Anthropic usage vocabulary.
+ */
+export function extractTokenUsage(
+  payload: Record<string, unknown> | undefined,
+): { inputTokens?: number; outputTokens?: number } {
+  const usage = payload?.usage;
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) {
+    return {};
+  }
+  const row = usage as Record<string, unknown>;
+  const num = (...names: string[]): number | undefined => {
+    for (const name of names) {
+      const value = row[name];
+      if (typeof value === "number" && Number.isFinite(value)) return value;
+    }
+    return undefined;
+  };
+  const inputTokens = num("prompt_tokens", "input_tokens");
+  const outputTokens = num("completion_tokens", "output_tokens");
+  return {
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+  };
 }
 
 function isRetryableStatus(config: GatewayConfig, status: number): boolean {
@@ -246,6 +322,9 @@ function authFailureResponse(
   const [status, message, code] = messages[reason];
   const body = formatErrorBody(format, status, message, code);
   const headers = rateLimitHeaders(rate);
+  if (status === 401) {
+    headers["WWW-Authenticate"] = 'Bearer realm="llm-switch-gateway"';
+  }
   if (reason === "rate_limited" && retryAfterSeconds) {
     headers["Retry-After"] = String(retryAfterSeconds);
   }
@@ -268,6 +347,7 @@ interface RequestLogFields {
   method: string;
   path: string;
   status: number;
+  requestId?: string;
   model?: string;
   provider?: string;
   keyId?: string;
@@ -283,6 +363,7 @@ function logRequest(enabled: boolean, fields: RequestLogFields): void {
     `status=${fields.status}`,
     `dur=${fields.durationMs}ms`,
   ];
+  if (fields.requestId) parts.push(`req=${fields.requestId}`);
   if (fields.model) parts.push(`model=${fields.model}`);
   if (fields.provider) parts.push(`provider=${fields.provider}`);
   if (fields.attempts && fields.attempts > 1) {
@@ -307,7 +388,11 @@ function applyCors(
   res.setHeader("Vary", "Origin");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "authorization, x-api-key, content-type, anthropic-version",
+    "authorization, x-api-key, content-type, anthropic-version, anthropic-beta, openai-beta, x-request-id",
+  );
+  res.setHeader(
+    "Access-Control-Expose-Headers",
+    "x-request-id, retry-after, x-ratelimit-limit, x-ratelimit-remaining, x-ratelimit-reset",
   );
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Max-Age", "600");
@@ -317,6 +402,9 @@ function applyCors(
 class ConcurrencyGate {
   private active = 0;
   constructor(private readonly max: number) {}
+  get inFlight(): number {
+    return this.active;
+  }
   tryAcquire(): boolean {
     if (this.active >= this.max) return false;
     this.active += 1;
@@ -332,12 +420,19 @@ export function createGatewayServer(
 ): Server {
   const limits = parseBridgeRuntimeLimits();
   const gate = new ConcurrencyGate(limits.maxConcurrency);
+  const breaker = new ProviderBreaker();
   const logEnabled = options.log !== false;
+  const startedAtIso = new Date().toISOString();
+  const startedMs = Date.now();
+  const stats = { requests: 0, errors4xx: 0, errors5xx: 0 };
 
   return createServer(async (req, res) => {
     const startedAt = Date.now();
+    stats.requests += 1;
     const config = readGatewayConfig();
     applyCors(req, res, config);
+    const requestId = requestIdOf(req);
+    res.setHeader("x-request-id", requestId);
 
     const url = new URL(
       req.url || "/",
@@ -347,10 +442,13 @@ export function createGatewayServer(
     const method = req.method || "GET";
 
     const finish = (status: number, extra: Partial<RequestLogFields> = {}) => {
+      if (status >= 500) stats.errors5xx += 1;
+      else if (status >= 400) stats.errors4xx += 1;
       logRequest(logEnabled, {
         method,
         path,
         status,
+        requestId,
         durationMs: Date.now() - startedAt,
         ...extra,
       });
@@ -389,6 +487,15 @@ export function createGatewayServer(
           ok: true,
           service: "llm-switch-gateway",
           instanceId: expectedId,
+          startedAt: state.instance?.startedAt ?? startedAtIso,
+          uptimeSeconds: Math.floor((Date.now() - startedMs) / 1000),
+          stats: {
+            requests: stats.requests,
+            errors4xx: stats.errors4xx,
+            errors5xx: stats.errors5xx,
+            activeConnections: gate.inFlight,
+            maxConcurrency: limits.maxConcurrency,
+          },
           providers: providers.map((provider) => ({
             name: provider.name,
             apiFormat: provider.apiFormat,
@@ -397,6 +504,7 @@ export function createGatewayServer(
           })),
           routes: listGatewayRoutes().length,
           activeKeys: listGatewayKeys().filter((key) => !key.revokedAt).length,
+          breakers: breaker.snapshot(),
         });
         finish(200);
         return;
@@ -452,7 +560,9 @@ export function createGatewayServer(
           service: "llm-switch-gateway",
           endpoints: [
             "GET /v1/models",
+            "GET /v1/models/{id}",
             "POST /v1/chat/completions",
+            "POST /v1/completions",
             "POST /v1/messages",
             "POST /v1/messages/count_tokens",
             "POST /v1/responses",
@@ -513,7 +623,12 @@ export function createGatewayServer(
       try {
         if (endpoint.kind === "models") {
           const models = listRoutableModels().filter((model) =>
-            keyAllowsTarget(auth.key, model.provider, model.upstreamModel),
+            keyAllowsTarget(
+              auth.key,
+              model.provider,
+              model.upstreamModel,
+              model.id,
+            ),
           );
           sendJson(res, 200, {
             object: "list",
@@ -529,6 +644,45 @@ export function createGatewayServer(
                 format: model.format,
               },
             })),
+          });
+          finish(200, { keyId: auth.key.id });
+          return;
+        }
+
+        if (endpoint.kind === "model-detail") {
+          const found = listRoutableModels().find(
+            (model) =>
+              model.id.toLowerCase() === (endpoint.modelId || "").toLowerCase(),
+          );
+          if (
+            !found ||
+            !keyAllowsTarget(
+              auth.key,
+              found.provider,
+              found.upstreamModel,
+              found.id,
+            )
+          ) {
+            const body = formatErrorBody(
+              endpoint.format,
+              404,
+              `模型「${endpoint.modelId}」不存在或不可访问。`,
+              "model_not_found",
+            );
+            sendJson(res, body.status, body.payload);
+            finish(404, { keyId: auth.key.id });
+            return;
+          }
+          sendJson(res, 200, {
+            id: found.id,
+            object: "model",
+            created: 0,
+            owned_by: found.provider,
+            llm_switch: {
+              provider: found.provider,
+              upstream_model: found.upstreamModel,
+              format: found.format,
+            },
           });
           finish(200, { keyId: auth.key.id });
           return;
@@ -561,6 +715,7 @@ export function createGatewayServer(
           key: auth.key,
           config,
           limits,
+          breaker,
         });
         touchGatewayKey(auth.key.id);
         finish(outcome.status, {
@@ -595,13 +750,17 @@ export function createGatewayServer(
 
 type EndpointKind =
   | "models"
+  | "model-detail"
   | "completion"
+  | "completion-legacy"
   | "embeddings"
   | "count_tokens";
 
 interface EndpointMatch {
   kind: EndpointKind;
   format: GatewayFormat;
+  /** For `model-detail`: the requested model id. */
+  modelId?: string;
 }
 
 function matchEndpoint(method: string, path: string): EndpointMatch | null {
@@ -609,10 +768,22 @@ function matchEndpoint(method: string, path: string): EndpointMatch | null {
   if (method === "GET" && normalized === "/models") {
     return { kind: "models", format: "openai-chat" };
   }
+  if (method === "GET" && normalized.startsWith("/models/")) {
+    const id = normalized.slice("/models/".length);
+    if (!id.includes("/")) {
+      return {
+        kind: "model-detail",
+        format: "openai-chat",
+        ...(id ? { modelId: decodeURIComponent(id) } : {}),
+      };
+    }
+  }
   if (method !== "POST") return null;
   switch (normalized) {
     case "/chat/completions":
       return { kind: "completion", format: "openai-chat" };
+    case "/completions":
+      return { kind: "completion-legacy", format: "openai-chat" };
     case "/messages":
       return { kind: "completion", format: "anthropic" };
     case "/messages/count_tokens":
@@ -634,6 +805,7 @@ interface DataRequestContext {
   key: GatewayKey;
   config: GatewayConfig;
   limits: ReturnType<typeof parseBridgeRuntimeLimits>;
+  breaker: ProviderBreaker;
 }
 
 interface DataRequestOutcome {
@@ -646,8 +818,13 @@ interface DataRequestOutcome {
 async function handleDataRequest(
   ctx: DataRequestContext,
 ): Promise<DataRequestOutcome> {
-  const { endpoint, body, res } = ctx;
+  const { endpoint, res } = ctx;
+  const body =
+    endpoint.kind === "completion-legacy"
+      ? legacyPromptToChatBody(ctx.body)
+      : ctx.body;
   const inbound = parseInboundRequest(endpoint.format, body);
+  if (endpoint.kind === "completion-legacy") inbound.legacyCompletion = true;
 
   let candidates: RouteCandidate[];
   try {
@@ -665,7 +842,12 @@ async function handleDataRequest(
   }
 
   const allowed = candidates.filter((candidate) =>
-    keyAllowsTarget(ctx.key, candidate.provider.name, candidate.model),
+    keyAllowsTarget(
+      ctx.key,
+      candidate.provider.name,
+      candidate.model,
+      inbound.requestedModel,
+    ),
   );
   if (!allowed.length) {
     const error = formatErrorBody(
@@ -678,13 +860,20 @@ async function handleDataRequest(
     return { status: error.status, model: inbound.requestedModel };
   }
 
+  // Skip providers in failure cooldown; if all of them are cooling, prefer a
+  // delayed attempt over an immediate hard failure.
+  const coolingFree = allowed.filter((candidate) =>
+    ctx.breaker.allows(candidate.provider.name),
+  );
+  const routable = coolingFree.length ? coolingFree : allowed;
+
   if (endpoint.kind === "embeddings") {
-    return forwardEmbeddings(ctx, inbound, allowed);
+    return forwardEmbeddings(ctx, inbound, routable);
   }
   if (endpoint.kind === "count_tokens") {
-    return forwardCountTokens(ctx, inbound, allowed);
+    return forwardCountTokens(ctx, inbound, routable);
   }
-  return forwardCompletion(ctx, inbound, allowed);
+  return forwardCompletion(ctx, inbound, routable);
 }
 
 /** Abort the upstream request as soon as the client goes away. */
@@ -734,7 +923,10 @@ async function forwardCompletion(
       const hasMore = index < candidates.length - 1;
       const provider = candidate.provider;
       const targetFormat = providerFormat(provider);
-      const passthrough = targetFormat === inbound.format;
+      // Legacy text completions always reshape the payload (chat → completion),
+      // so the raw passthrough path never applies to them.
+      const passthrough =
+        targetFormat === inbound.format && !inbound.legacyCompletion;
 
       const upstreamBody = passthrough
         ? { ...inbound.body, model: candidate.model }
@@ -748,13 +940,16 @@ async function forwardCompletion(
         response = await requestWithNodeTransport({
           url: upstreamUrl(provider, upstreamPath(targetFormat)),
           method: "POST",
-          headers: buildUpstreamHeaders(provider),
+          // Relay beta headers only when the wire format is preserved; a
+          // translated request has no guarantee the beta flag still applies.
+          headers: buildUpstreamHeaders(provider, passthrough ? ctx.req : undefined),
           body: JSON.stringify(upstreamBody),
           ...transportOptionsFor(provider, limits, abort.signal),
         });
       } catch (err) {
         if (abort.signal.aborted) return { status: 499, attempts: index + 1 };
         const message = err instanceof Error ? err.message : String(err);
+        ctx.breaker.failure(provider.name, message);
         failures.push({ candidate, status: 502, message });
         if (hasMore && config.fallback.enabled) continue;
         return respondWithFailures(res, inbound, failures, index + 1);
@@ -765,12 +960,16 @@ async function forwardCompletion(
         const retryable =
           config.fallback.enabled && isRetryableStatus(config, response.status);
         if (hasMore && retryable) {
+          ctx.breaker.failure(provider.name, `HTTP ${response.status}`);
           failures.push({
             candidate,
             status: response.status,
             message: text.slice(0, 300),
           });
           continue;
+        }
+        if (response.status >= 500) {
+          ctx.breaker.failure(provider.name, `HTTP ${response.status}`);
         }
         const error = translateUpstreamError(
           inbound.format,
@@ -787,6 +986,7 @@ async function forwardCompletion(
       }
 
       // Committed to this candidate: no fallback once bytes are written.
+      ctx.breaker.success(provider.name);
       if (!inbound.stream) {
         let payload: Record<string, unknown>;
         try {
@@ -820,7 +1020,22 @@ async function forwardCompletion(
               ),
               inbound.requestedModel,
             );
-        sendJson(res, 200, finalBody);
+        sendJson(
+          res,
+          200,
+          inbound.legacyCompletion
+            ? chatCompletionToLegacyCompletion(
+                finalBody,
+                inbound.requestedModel,
+              )
+            : finalBody,
+        );
+        recordUsage({
+          keyId: ctx.key.id,
+          provider: provider.name,
+          model: inbound.requestedModel,
+          ...extractTokenUsage(payload),
+        });
         return {
           status: 200,
           model: inbound.requestedModel,
@@ -829,7 +1044,19 @@ async function forwardCompletion(
         };
       }
 
-      await pipeStream(response, res, inbound, targetFormat, passthrough);
+      const streamUsage = await pipeStream(
+        response,
+        res,
+        inbound,
+        targetFormat,
+        passthrough,
+      );
+      recordUsage({
+        keyId: ctx.key.id,
+        provider: provider.name,
+        model: inbound.requestedModel,
+        ...streamUsage,
+      });
       return {
         status: 200,
         model: inbound.requestedModel,
@@ -871,7 +1098,8 @@ function respondWithFailures(
 /**
  * Relay a streaming upstream response. Passthrough copies bytes verbatim;
  * otherwise upstream frames are decoded to hub chunks and re-encoded into the
- * inbound protocol.
+ * inbound protocol. Usage lines spotted in decoded chunks are returned so the
+ * caller can account tokens.
  */
 async function pipeStream(
   upstream: NodeTransportResponse,
@@ -879,8 +1107,17 @@ async function pipeStream(
   inbound: InboundRequest,
   targetFormat: GatewayFormat,
   passthrough: boolean,
-): Promise<void> {
+): Promise<{ inputTokens?: number; outputTokens?: number }> {
   res.writeHead(200, { ...SSE_HEADERS });
+
+  const usage: { inputTokens?: number; outputTokens?: number } = {};
+  const noteUsage = (payload: Record<string, unknown>): void => {
+    const found = extractTokenUsage(payload);
+    if (found.inputTokens !== undefined) usage.inputTokens = found.inputTokens;
+    if (found.outputTokens !== undefined) {
+      usage.outputTokens = found.outputTokens;
+    }
+  };
 
   let lastWrite = Date.now();
   const heartbeat = setInterval(() => {
@@ -899,7 +1136,7 @@ async function pipeStream(
   if (!reader) {
     clearInterval(heartbeat);
     res.end();
-    return;
+    return usage;
   }
 
   const decoder = createUpstreamDecoder(targetFormat, inbound.requestedModel);
@@ -909,6 +1146,7 @@ async function pipeStream(
 
   const emit = (chunks: Array<Record<string, unknown>>) => {
     for (const chunk of chunks) {
+      noteUsage(chunk);
       const normalized = withRequestedModel(chunk, inbound.requestedModel);
       for (const frame of encoder.encode(normalized)) write(frame);
     }
@@ -945,6 +1183,7 @@ async function pipeStream(
     clearInterval(heartbeat);
     res.end();
   }
+  return usage;
 }
 
 /**
@@ -982,16 +1221,18 @@ async function forwardEmbeddings(
         response = await requestWithNodeTransport({
           url: upstreamUrl(candidate.provider, "/embeddings"),
           method: "POST",
-          headers: buildUpstreamHeaders(candidate.provider),
+          headers: buildUpstreamHeaders(candidate.provider, ctx.req),
           body: JSON.stringify({ ...inbound.body, model: candidate.model }),
           ...transportOptionsFor(candidate.provider, limits, abort.signal),
         });
       } catch (err) {
         if (abort.signal.aborted) return { status: 499, attempts: index + 1 };
+        const message = err instanceof Error ? err.message : String(err);
+        ctx.breaker.failure(candidate.provider.name, message);
         failures.push({
           candidate,
           status: 502,
-          message: err instanceof Error ? err.message : String(err),
+          message,
         });
         if (hasMore && config.fallback.enabled) continue;
         return respondWithFailures(res, inbound, failures, index + 1);
@@ -1004,6 +1245,10 @@ async function forwardEmbeddings(
           config.fallback.enabled &&
           isRetryableStatus(config, response.status)
         ) {
+          ctx.breaker.failure(
+            candidate.provider.name,
+            `HTTP ${response.status}`,
+          );
           failures.push({
             candidate,
             status: response.status,
@@ -1025,6 +1270,7 @@ async function forwardEmbeddings(
         };
       }
 
+      ctx.breaker.success(candidate.provider.name);
       let payload: Record<string, unknown>;
       try {
         payload = JSON.parse(text) as Record<string, unknown>;
@@ -1032,6 +1278,12 @@ async function forwardEmbeddings(
         payload = {};
       }
       sendJson(res, 200, withRequestedModel(payload, inbound.requestedModel));
+      recordUsage({
+        keyId: ctx.key.id,
+        provider: candidate.provider.name,
+        model: inbound.requestedModel,
+        ...extractTokenUsage(payload),
+      });
       return {
         status: 200,
         model: inbound.requestedModel,
@@ -1066,12 +1318,13 @@ async function forwardCountTokens(
       const response = await requestWithNodeTransport({
         url: upstreamUrl(native.provider, "/messages/count_tokens"),
         method: "POST",
-        headers: buildUpstreamHeaders(native.provider),
+        headers: buildUpstreamHeaders(native.provider, ctx.req),
         body: JSON.stringify({ ...inbound.body, model: native.model }),
         ...transportOptionsFor(native.provider, limits, abort.signal),
       });
       const text = await response.text().catch(() => "");
       if (response.ok) {
+        ctx.breaker.success(native.provider.name);
         try {
           sendJson(res, 200, JSON.parse(text) as unknown);
         } catch {

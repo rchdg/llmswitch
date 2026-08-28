@@ -8,7 +8,7 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, openSync } from "node:fs";
+import { existsSync, openSync, renameSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDir } from "../utils/fs.js";
@@ -48,6 +48,20 @@ export function getGatewayLogPath(): string {
   return join(getGatewayDir(), "gateway.log");
 }
 
+const LOG_ROTATE_BYTES = 10 * 1024 * 1024;
+
+/** Size-based rotation at process start: gateway.log → gateway.log.old. */
+export function rotateGatewayLogIfNeeded(): void {
+  const path = getGatewayLogPath();
+  try {
+    if (statSync(path).size < LOG_ROTATE_BYTES) return;
+    rmSync(`${path}.old`, { force: true });
+    renameSync(path, `${path}.old`);
+  } catch {
+    // No log file yet, or rotation raced with another process; keep going.
+  }
+}
+
 function controlUrl(host: string, port: number, path: string): string {
   return `http://${formatHostForUrl(host)}:${port}${path}`;
 }
@@ -56,6 +70,22 @@ export interface GatewayProbe {
   reachable: boolean;
   healthy: boolean;
   instanceId?: string;
+  startedAt?: string;
+  uptimeSeconds?: number;
+  stats?: {
+    requests: number;
+    errors4xx: number;
+    errors5xx: number;
+    activeConnections: number;
+    maxConcurrency: number;
+  };
+  /** Provider cooldown states reported by the daemon (token-authenticated). */
+  breakers?: Array<{
+    provider: string;
+    consecutiveFailures: number;
+    coolingMsRemaining: number;
+    lastError: string;
+  }>;
 }
 
 export async function probeGateway(
@@ -80,12 +110,24 @@ export async function probeGateway(
     }
     const instanceId =
       typeof body?.instanceId === "string" ? body.instanceId : undefined;
+    const breakers = Array.isArray(body?.breakers)
+      ? (body!.breakers as GatewayProbe["breakers"])
+      : undefined;
+    const stats = body?.stats as GatewayProbe["stats"];
     return {
       reachable: true,
       healthy: Boolean(
         response.ok && expected && instanceId && instanceId === expected.id,
       ),
       instanceId,
+      ...(typeof body?.startedAt === "string"
+        ? { startedAt: body.startedAt }
+        : {}),
+      ...(typeof body?.uptimeSeconds === "number"
+        ? { uptimeSeconds: body.uptimeSeconds }
+        : {}),
+      ...(stats && typeof stats === "object" ? { stats } : {}),
+      breakers,
     };
   } catch {
     return { reachable: false, healthy: false };
@@ -152,6 +194,7 @@ export async function startGatewayDaemon(
   updateGatewayState((state) => ({ ...state, listener, instance: null }));
 
   ensureDir(getGatewayDir());
+  rotateGatewayLogIfNeeded();
   const logFd = openSync(getGatewayLogPath(), "a");
   const runner = resolveDaemonRunner();
   const args = [
@@ -188,6 +231,15 @@ export async function stopGateway(): Promise<boolean> {
     state.listener.advertiseHost,
     state.listener.port,
   );
+  if (!probe.reachable) {
+    // Stale identity: the process is gone, so clear it instead of erroring.
+    updateGatewayState((current) =>
+      current.instance?.id === instance.id
+        ? { ...current, instance: null }
+        : current,
+    );
+    return false;
+  }
   if (!probe.healthy || probe.instanceId !== instance.id) {
     throw new GatewayControlError(
       "无法验证 gateway 实例身份；为避免误杀，未发送任何进程信号。",
@@ -235,6 +287,8 @@ export async function runGatewayForeground(
   port: number,
   allowRemote = false,
 ): Promise<void> {
+  ensureDir(getGatewayDir());
+  rotateGatewayLogIfNeeded();
   const listener = resolveGatewayListener({ host, port, allowRemote });
   const previous = readGatewayState();
   const instance: GatewayInstanceState = {

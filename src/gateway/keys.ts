@@ -14,7 +14,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { atomicWriteFile, ensureDir } from "../utils/fs.js";
 import { getGatewayDir, getGatewayKeysPath } from "../utils/paths.js";
-import { checkRateLimit, type RateLimitDecision } from "./rate-limit.js";
+import { checkDailyQuota, checkRateLimit, type RateLimitDecision } from "./rate-limit.js";
 import {
   isGatewayFormat,
   type GatewayFormat,
@@ -26,6 +26,11 @@ const KEY_PREFIX = "llmsk";
 const KEY_ID_BYTES = 6;
 const KEY_SECRET_BYTES = 32;
 const SALT_BYTES = 16;
+/**
+ * Explicit "never rate-limit this key" marker. `0` keeps the legacy meaning of
+ * inheriting the global default so existing key files behave unchanged.
+ */
+export const UNLIMITED_RATE_LIMIT = -1;
 /** Minimum gap between lastUsedAt persists for one key. */
 const TOUCH_INTERVAL_MS = 60_000;
 const lastTouchedAt = new Map<string, number>();
@@ -77,6 +82,37 @@ function normalizeFormats(value: unknown): GatewayKeyScopeFormat[] {
   return out.length ? out : ["*"];
 }
 
+/**
+ * Strict format validation for newly issued keys: an invalid value must fail
+ * loudly instead of silently widening the scope to every format.
+ */
+function assertValidFormats(value: unknown): void {
+  const list = stringList(value);
+  for (const item of list) {
+    if (item !== "*" && !isGatewayFormat(item)) {
+      throw new GatewayKeyError(
+        `无效的接口格式「${item}」。可用：openai-chat, anthropic, openai-responses, *`,
+      );
+    }
+  }
+}
+
+/** Non-negative integer or 0. */
+function nonNegative(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : 0;
+}
+
+/** Per-key rate limit: >= 1 is a cap, 0 inherits the global default, -1 is unlimited. */
+function normalizeRateLimit(value: unknown): number {
+  if (value === UNLIMITED_RATE_LIMIT) return UNLIMITED_RATE_LIMIT;
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return Math.floor(value);
+  }
+  return 0;
+}
+
 function normalizeKey(raw: unknown): GatewayKey | null {
   const row = asRecord(raw);
   if (!row) return null;
@@ -99,10 +135,8 @@ function normalizeKey(raw: unknown): GatewayKey | null {
     providers: stringList(row.providers),
     models: stringList(row.models),
     formats: normalizeFormats(row.formats),
-    rateLimitPerMinute:
-      typeof row.rateLimitPerMinute === "number" && row.rateLimitPerMinute >= 0
-        ? row.rateLimitPerMinute
-        : 0,
+    rateLimitPerMinute: normalizeRateLimit(row.rateLimitPerMinute),
+    requestsPerDay: nonNegative(row.requestsPerDay),
     lastUsedAt: typeof row.lastUsedAt === "string" ? row.lastUsedAt : null,
   };
 }
@@ -145,7 +179,13 @@ export interface CreateGatewayKeyOptions {
   providers?: string[];
   models?: string[];
   formats?: string[];
+  /**
+   * Per-minute request cap. `> 0` is a hard cap, `0` inherits the global
+   * default, `-1` is explicitly unlimited.
+   */
   rateLimitPerMinute?: number;
+  /** Daily request quota; 0 (default) means no daily quota. */
+  requestsPerDay?: number;
 }
 
 export interface CreatedGatewayKey {
@@ -157,6 +197,7 @@ export interface CreatedGatewayKey {
 export function createGatewayKey(
   options: CreateGatewayKeyOptions = {},
 ): CreatedGatewayKey {
+  assertValidFormats(options.formats);
   const id = randomBytes(KEY_ID_BYTES).toString("hex");
   const secret = randomBytes(KEY_SECRET_BYTES).toString("base64url");
   const salt = randomBytes(SALT_BYTES).toString("hex");
@@ -183,11 +224,8 @@ export function createGatewayKey(
     providers: stringList(options.providers),
     models: stringList(options.models),
     formats: normalizeFormats(options.formats),
-    rateLimitPerMinute:
-      typeof options.rateLimitPerMinute === "number" &&
-      options.rateLimitPerMinute >= 0
-        ? Math.floor(options.rateLimitPerMinute)
-        : 0,
+    rateLimitPerMinute: normalizeRateLimit(options.rateLimitPerMinute),
+    requestsPerDay: nonNegative(options.requestsPerDay),
     lastUsedAt: null,
   };
 
@@ -216,6 +254,90 @@ export function deleteGatewayKey(idOrName: string): GatewayKey {
   return target;
 }
 
+export interface UpdateGatewayKeyPatch {
+  name?: string;
+  /** Replaces the scope when provided. */
+  providers?: string[];
+  /** Replaces the scope when provided. */
+  models?: string[];
+  /** Replaces the scope when provided; validated strictly. */
+  formats?: string[];
+  /** Per-minute cap: -1 unlimited, 0 inherit global, > 0 hard cap. */
+  rateLimitPerMinute?: number;
+  /** Daily quota; 0 clears the quota. */
+  requestsPerDay?: number;
+  /**
+   * New expiry relative to now, in days. 0 clears the expiry; omit to leave
+   * the existing expiry untouched.
+   */
+  expiresInDays?: number;
+}
+
+export function updateGatewayKey(
+  idOrName: string,
+  patch: UpdateGatewayKeyPatch,
+): GatewayKey {
+  assertValidFormats(patch.formats ?? []);
+  const days = patch.expiresInDays;
+  if (days !== undefined && (days < 0 || !Number.isFinite(days))) {
+    throw new GatewayKeyError("有效期天数必须是非负数");
+  }
+  const keys = listGatewayKeys();
+  const target = findKeyByIdOrName(keys, idOrName);
+  if (!target) throw new GatewayKeyError(`未找到 API Key「${idOrName}」`);
+  const next: GatewayKey = {
+    ...target,
+    name: patch.name?.trim() || target.name,
+    ...(patch.providers ? { providers: stringList(patch.providers) } : {}),
+    ...(patch.models ? { models: stringList(patch.models) } : {}),
+    ...(patch.formats ? { formats: normalizeFormats(patch.formats) } : {}),
+    ...(patch.rateLimitPerMinute !== undefined
+      ? { rateLimitPerMinute: normalizeRateLimit(patch.rateLimitPerMinute) }
+      : {}),
+    ...(patch.requestsPerDay !== undefined
+      ? { requestsPerDay: nonNegative(patch.requestsPerDay) }
+      : {}),
+    ...(days !== undefined
+      ? {
+          expiresAt:
+            days > 0
+              ? new Date(Date.now() + days * 86_400_000).toISOString()
+              : null,
+        }
+      : {}),
+  };
+  writeGatewayKeys(keys.map((key) => (key.id === target.id ? next : key)));
+  return next;
+}
+
+/**
+ * Re-issue a key with a fresh id and secret while keeping its scopes. The old
+ * plaintext stops working immediately; the new one is shown once.
+ */
+export function rotateGatewayKey(idOrName: string): CreatedGatewayKey {
+  const keys = listGatewayKeys();
+  const target = findKeyByIdOrName(keys, idOrName);
+  if (!target) throw new GatewayKeyError(`未找到 API Key「${idOrName}」`);
+
+  const id = randomBytes(KEY_ID_BYTES).toString("hex");
+  const secret = randomBytes(KEY_SECRET_BYTES).toString("base64url");
+  const salt = randomBytes(SALT_BYTES).toString("hex");
+  const rotated: GatewayKey = {
+    ...target,
+    id,
+    hash: hashSecret(secret, salt),
+    salt,
+    hint: `${KEY_PREFIX}-${id}-${secret.slice(0, 4)}…${secret.slice(-4)}`,
+    createdAt: new Date().toISOString(),
+    lastUsedAt: null,
+  };
+  writeGatewayKeys(keys.map((key) => (key.id === target.id ? rotated : key)));
+  return {
+    key: rotated,
+    plaintext: `${KEY_PREFIX}-${id}-${secret}`,
+  };
+}
+
 function findKeyByIdOrName(
   keys: readonly GatewayKey[],
   idOrName: string,
@@ -242,6 +364,7 @@ export function publicKeyView(key: GatewayKey) {
     models: key.models,
     formats: key.formats,
     rateLimitPerMinute: key.rateLimitPerMinute,
+    requestsPerDay: key.requestsPerDay,
     lastUsedAt: key.lastUsedAt,
   };
 }
@@ -292,7 +415,9 @@ function parsePlaintext(
 
 /** In-memory fixed-window counters were replaced by a cross-process store. */
 export {
+  checkDailyQuota,
   checkRateLimit,
+  peekDailyQuota,
   peekRateLimit,
   resetRateLimits,
   type RateLimitDecision,
@@ -305,6 +430,16 @@ export interface AuthenticateOptions {
   defaultRateLimitPerMinute?: number;
   keys?: readonly GatewayKey[];
   now?: number;
+}
+
+/** -1 = unlimited, > 0 = per-key cap, otherwise fall back to the global default. */
+export function resolveKeyRateLimit(
+  keyLimit: number,
+  defaultLimit: number,
+): number {
+  if (keyLimit === UNLIMITED_RATE_LIMIT) return 0;
+  if (keyLimit > 0) return keyLimit;
+  return defaultLimit > 0 ? defaultLimit : 0;
 }
 
 export function authenticateGatewayKey(
@@ -334,10 +469,10 @@ export function authenticateGatewayKey(
     }
   }
 
-  const limit =
-    candidate.rateLimitPerMinute > 0
-      ? candidate.rateLimitPerMinute
-      : (options.defaultRateLimitPerMinute ?? 0);
+  const limit = resolveKeyRateLimit(
+    candidate.rateLimitPerMinute,
+    options.defaultRateLimitPerMinute ?? 0,
+  );
   const rate = checkRateLimit(candidate.id, limit, now);
   if (!rate.allowed) {
     return {
@@ -346,6 +481,18 @@ export function authenticateGatewayKey(
       retryAfterSeconds: rate.retryAfterSeconds,
       rate,
     };
+  }
+
+  if (candidate.requestsPerDay > 0) {
+    const daily = checkDailyQuota(candidate.id, candidate.requestsPerDay, now);
+    if (!daily.allowed) {
+      return {
+        ok: false,
+        reason: "rate_limited",
+        retryAfterSeconds: daily.retryAfterSeconds,
+        rate: daily,
+      };
+    }
   }
 
   return { ok: true, key: candidate, rate };
@@ -370,21 +517,56 @@ export function touchGatewayKey(id: string, now = Date.now()): void {
   }
 }
 
-/** Whether a key may use the resolved provider and model. */
+/**
+ * Whether a key may use the resolved provider and model.
+ *
+ * `model` is the upstream id resolved by the router; `requestedModel` is the
+ * raw id the client sent (an alias or a qualified `provider/model` reference).
+ * A scope entry matches when it equals either id, so keys scoped to an alias
+ * keep working after the alias is remapped to a different upstream id.
+ */
 export function keyAllowsTarget(
   key: GatewayKey,
   providerName: string,
   model: string,
+  requestedModel?: string,
 ): boolean {
   if (key.providers.length && !key.providers.includes(providerName)) {
     return false;
   }
-  if (key.models.length) {
-    const wanted = model.toLowerCase();
-    const allowed = key.models.some(
-      (item) => item.toLowerCase() === wanted,
+  if (!key.models.length) return true;
+  return modelScopeMatches(key.models, providerName, model, requestedModel);
+}
+
+function modelScopeMatches(
+  scope: readonly string[],
+  providerName: string,
+  model: string,
+  requestedModel?: string,
+): boolean {
+  const provider = providerName.trim().toLowerCase();
+  // Every spelling that should count as "this model on this provider".
+  const wanted = new Set<string>();
+  const add = (value: string | undefined): void => {
+    const id = value?.trim().toLowerCase();
+    if (!id) return;
+    wanted.add(id);
+    wanted.add(`${provider}/${id}`);
+  };
+  add(model);
+  add(requestedModel);
+
+  return scope.some((entry) => {
+    const id = entry.trim().toLowerCase();
+    if (!id) return false;
+    if (wanted.has(id)) return true;
+    // A scoped entry may itself be qualified (`provider/model`); compare both
+    // halves so an entry for another provider never matches by accident.
+    const separator = id.indexOf("/");
+    if (separator <= 0) return false;
+    return (
+      id.slice(0, separator) === provider &&
+      wanted.has(id.slice(separator + 1))
     );
-    if (!allowed) return false;
-  }
-  return true;
+  });
 }

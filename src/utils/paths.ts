@@ -58,6 +58,10 @@ export function getGatewayKeysPath(): string {
   return join(getGatewayDir(), "keys.json");
 }
 
+export function getGatewayUsagePath(): string {
+  return join(getGatewayDir(), "usage.json");
+}
+
 export function getGatewayStatePath(): string {
   return join(getGatewayDir(), "state.json");
 }

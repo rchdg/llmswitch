@@ -189,17 +189,34 @@ curl http://127.0.0.1:17900/v1/messages \
 (OpenAI Chat, OpenAI Responses, Anthropic Messages) combine freely with all
 three upstream formats, including streaming and tool calls. When inbound and
 upstream formats match, bytes are passed through verbatim to avoid a lossy
-round-trip.
+round-trip. Known limitation: stateful OpenAI Responses features
+(`previous_response_id`, `store`, background mode) only work in same-format
+passthrough, not across format translation.
+
+Upstream URLs get a `/v1` prefix by default; non-standard paths can be
+customized:
+
+```bash
+# Use baseUrl verbatim (e.g. Gemini's OpenAI-compatible …/v1beta/openai endpoint)
+llms gateway provider add --path-prefix ""
+# Or a custom prefix
+llms gateway provider edit my-provider --path-prefix v2
+```
 
 | Endpoint | Description |
 | --- | --- |
 | `GET /v1/models` | Routable models (filtered by key scope) |
+| `GET /v1/models/{id}` | Single model detail (OpenAI-client compatible) |
 | `POST /v1/chat/completions` | OpenAI Chat Completions |
+| `POST /v1/completions` | Legacy Text Completions (`prompt` is converted to messages) |
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/messages/count_tokens` | Native on Anthropic upstreams; computed locally otherwise (see below) |
 | `POST /v1/responses` | OpenAI Responses |
 | `POST /v1/embeddings` | OpenAI-compatible upstreams only |
 | `GET /health` | Liveness probe (unauthenticated, exposes no configuration) |
+
+Every response carries `x-request-id` (clients may supply their own to correlate
+logs), which is also forwarded upstream.
 
 **Model resolution order:**
 
@@ -228,17 +245,41 @@ no further switching occurs, so clients never receive two spliced outputs.
 llms gateway config set --fallback true --max-attempts 3 --retry-statuses 429,500,502,503,504
 ```
 
-**API key management**: only hashes are stored; keys support revocation,
-expiry and scoping.
+**Failure cooldown**: providers that fail repeatedly enter an exponential
+backoff cooldown (starting at 5s, capped at 2 minutes) and are skipped by
+routing while cooling down. If every candidate is cooling down they are still
+tried. `llms gateway status` shows which providers are cooling.
+
+```bash
+# Probe provider connectivity (model list; --call also sends a 1-token completion)
+llms gateway provider test my-provider --call
+
+# Re-fetch the model list from the upstream
+llms gateway provider refresh-models my-provider
+
+# Custom upstream headers (repeatable)
+llms gateway provider edit my-provider --header "X-Title: my-app"
+```
+
+**API key management**: only hashes are stored; keys support scoping, limits,
+expiry, editing and rotation.
 
 ```bash
 llms gateway key create --name partner \
   --providers deepseek --models deepseek-chat \
-  --formats openai-chat --rate-limit 60 --expires-in-days 30
+  --formats openai-chat --rate-limit 60 --expires-in-days 30 \
+  --daily-requests 5000
 
 llms gateway key list
+llms gateway key edit <id> --rate-limit 120          # limits / scopes / expiry
+llms gateway key rotate <id>                          # new plaintext, old key dies
 llms gateway key revoke <id>
 ```
+
+Scope semantics: `--models` matches the model spelling the client sends — a
+key scoped to an alias is usable only through that alias spelling, while a
+`provider/model` entry accepts both spellings. Typos produce a warning at
+creation time.
 
 **Rate limiting**: counters are persisted in `gateway/rate-limit.json`, so they
 survive a restart and are shared by every gateway process using the same config
@@ -260,6 +301,10 @@ llms gateway config set --rate-limit 120
 llms gateway ratelimit show
 llms gateway ratelimit reset
 ```
+
+`--rate-limit` semantics: `-1` disables limiting entirely (exempt from the
+global default), `0` inherits the global default, `> 0` is a hard cap;
+`--daily-requests` adds a per-UTC-day request quota on top.
 
 The counter file is lock-protected. If the lock cannot be taken quickly the
 request is allowed rather than blocked: a slightly loose limit beats stalling
@@ -306,6 +351,40 @@ base64 header for PNG / JPEG / GIF / WebP and priced at `width × height / 750`.
 Images whose dimensions cannot be determined (URL sources, for example) fall
 back to a conservative figure.
 
+**Usage accounting**: the gateway records daily request and token counts per
+(key / provider / model) combination in `gateway/usage.json` (kept 90 days):
+
+```bash
+llms gateway usage --days 7
+llms gateway usage --json
+llms gateway usage reset
+```
+
+**Logs**: written to `~/.config/llm-switch/gateway/gateway.log`, recording only
+key ids — never plaintext keys or upstream credentials. Each line carries
+`req=<request-id>` for correlating client and upstream logs. Files over 10MB are
+rotated to `gateway.log.old` on startup:
+
+```bash
+llms gateway logs              # last 100 lines
+llms gateway logs --lines 500
+llms gateway logs --follow     # tail continuously
+```
+
+**Runtime limits** (timeouts / concurrency / body size) are tuned through
+environment variables shared with the Bridge:
+
+| Environment variable | Default | Description |
+| --- | --- | --- |
+| `LLM_SWITCH_MAX_CONCURRENCY` | 16 | Max concurrent requests |
+| `LLM_SWITCH_MAX_BODY_BYTES` | 16MB | Request body cap |
+| `LLM_SWITCH_MAX_RESPONSE_BYTES` | 32MB | Upstream response cap |
+| `LLM_SWITCH_CONNECT_TIMEOUT_MS` | 30000 | Upstream connect timeout |
+| `LLM_SWITCH_IDLE_TIMEOUT_MS` | 90000 | Streaming idle timeout |
+| `LLM_SWITCH_TOTAL_TIMEOUT_MS` | 600000 | Total timeout per request |
+
+`llms gateway config show` also prints the effective values.
+
 **Exposure safety**: the gateway binds to loopback by default. Binding to a
 non-loopback address requires `--allow-remote` *and* at least one active API
 key, otherwise startup is refused.
@@ -316,14 +395,12 @@ llms gateway start --host 0.0.0.0 --allow-remote
 
 The gateway speaks plain HTTP only. Terminate TLS with a reverse proxy (Nginx /
 Caddy) rather than exposing raw HTTP to the internet. Browser clients need CORS
-enabled explicitly:
+enabled explicitly (the `anthropic-beta` request header is allowed, and the
+rate-limit / request-id response headers are exposed):
 
 ```bash
 llms gateway config set --cors-origins https://app.example.com
 ```
-
-Logs go to `~/.config/llm-switch/gateway/gateway.log` and record only key ids,
-never plaintext keys or upstream credentials.
 
 ---
 
@@ -342,9 +419,13 @@ never plaintext keys or upstream credentials.
 | `llms bridge status` | View Bridge status |
 | `llms gateway start` | Start the outward-facing AI gateway |
 | `llms gateway provider import` | Import gateway providers from tool configs |
+| `llms gateway provider test <name>` | Probe provider connectivity |
 | `llms gateway key create` | Issue a gateway API key |
+| `llms gateway key rotate <id>` | Rotate a gateway API key |
 | `llms gateway status` | View gateway status |
 | `llms gateway ratelimit show` | Inspect per-key rate-limit usage |
+| `llms gateway usage` | Daily usage accounting |
+| `llms gateway logs` | View gateway logs |
 | `llms path` | View data directory |
 
 `<tool>` can be `claude`, `codex`, or `opencode`.

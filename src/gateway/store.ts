@@ -10,7 +10,7 @@ import { existsSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import { chmodSync } from "node:fs";
 import { TOOLS, isApiFormat, normalizeProxyValue } from "../types.js";
 import type { Tool } from "../types.js";
-import { normalizeBaseUrlForFormat } from "../utils/base-url.js";
+import { ensureOpenAiV1BaseUrl, isOpenAiApiFormat } from "../utils/base-url.js";
 import { atomicWriteFile, ensureDir, maskSecret } from "../utils/fs.js";
 import {
   getGatewayConfigPath,
@@ -29,6 +29,16 @@ import {
 } from "./types.js";
 
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+/** Sanitized shape for `pathPrefix`: no slashes at the edges, bounded length. */
+const PATH_PREFIX_MAX = 64;
+
+export function normalizePathPrefix(value: unknown): string {
+  const raw = typeof value === "string" ? value.trim() : "";
+  const trimmed = raw.replace(/^\/+|\/+$/g, "");
+  if (!trimmed) return "";
+  if (trimmed.length > PATH_PREFIX_MAX || /[?#]/.test(trimmed)) return "v1";
+  return trimmed;
+}
 
 export function assertValidProviderName(name: string): void {
   if (!NAME_RE.test(name)) {
@@ -45,6 +55,26 @@ function ensureGatewayDir(): void {
   } catch {
     // Windows relies on user-directory ACLs.
   }
+}
+
+/**
+ * Gateway-specific base URL normalization.
+ *
+ * With the default prefix (`v1`, undefined field) OpenAI-format bases keep the
+ * historical "exactly one /v1" shape. Once a provider pins an explicit
+ * `pathPrefix` (including `""`), the base URL is the operator's business: only
+ * trailing slashes are trimmed, and `upstreamUrl` joins the prefix.
+ */
+function normalizeProviderBaseUrl(
+  apiFormat: GatewayProvider["apiFormat"],
+  baseUrl: string,
+  hasExplicitPrefix: boolean,
+): string {
+  const trimmed = baseUrl.trim();
+  if (!hasExplicitPrefix && isOpenAiApiFormat(apiFormat)) {
+    return ensureOpenAiV1BaseUrl(trimmed);
+  }
+  return trimmed.replace(/\/+$/, "");
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -78,6 +108,8 @@ function normalizeProvider(
   const baseUrl = String(raw.baseUrl || "");
   if (!baseUrl) return null;
   const source = asRecord(raw.sourceProfile);
+  const pathPrefix =
+    raw.pathPrefix === undefined ? undefined : normalizePathPrefix(raw.pathPrefix);
   return {
     name,
     displayName:
@@ -85,11 +117,13 @@ function normalizeProvider(
         ? raw.displayName
         : name,
     apiFormat,
-    baseUrl: normalizeBaseUrlForFormat(apiFormat, baseUrl),
+    baseUrl: normalizeProviderBaseUrl(apiFormat, baseUrl, pathPrefix !== undefined),
     apiKey: typeof raw.apiKey === "string" ? raw.apiKey : "",
     models: stringList(raw.models),
     headers: (asRecord(raw.headers) as Record<string, string> | null) ?? {},
     proxy: normalizeProxyValue(raw.proxy),
+    pathPrefix:
+      raw.pathPrefix === undefined ? undefined : normalizePathPrefix(raw.pathPrefix),
     priority: typeof raw.priority === "number" ? raw.priority : 100,
     enabled: raw.enabled !== false,
     sourceProfile:
@@ -148,13 +182,22 @@ export function saveGatewayProvider(provider: GatewayProvider): GatewayProvider 
   if (!provider.baseUrl?.trim()) {
     throw new Error("baseUrl 不能为空");
   }
+  const nextPathPrefix =
+    provider.pathPrefix === undefined
+      ? undefined
+      : normalizePathPrefix(provider.pathPrefix);
   const next: GatewayProvider = {
     ...provider,
     displayName: provider.displayName || provider.name,
-    baseUrl: normalizeBaseUrlForFormat(provider.apiFormat, provider.baseUrl),
+    baseUrl: normalizeProviderBaseUrl(
+      provider.apiFormat,
+      provider.baseUrl,
+      nextPathPrefix !== undefined,
+    ),
     apiKey: provider.apiKey ?? "",
     models: stringList(provider.models),
     headers: provider.headers || {},
+    pathPrefix: nextPathPrefix,
     priority:
       typeof provider.priority === "number" ? provider.priority : 100,
     enabled: provider.enabled !== false,
@@ -199,6 +242,9 @@ export function publicProviderView(provider: GatewayProvider) {
     baseUrl: provider.baseUrl,
     apiKey: maskSecret(provider.apiKey),
     models: provider.models,
+    pathPrefix: provider.pathPrefix ?? "v1",
+    /** Header names only; values may carry secrets. */
+    headerNames: Object.keys(provider.headers || {}),
     priority: provider.priority,
     enabled: provider.enabled,
     proxy: provider.proxy || null,
