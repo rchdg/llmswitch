@@ -3,6 +3,7 @@ import { TOOLS } from "./types.js";
 import { registerToolCommand } from "./commands/tool.js";
 import { registerLaunchCommand } from "./commands/launch-cmd.js";
 import { registerBridgeCommand } from "./commands/bridge-cmd.js";
+import { registerGatewayCommand } from "./commands/gateway-cmd.js";
 import { registerSetupCommand } from "./commands/setup-cmd.js";
 import { registerHomeCommand } from "./commands/home-cmd.js";
 import { getAppConfigRoot } from "./utils/paths.js";
@@ -28,6 +29,7 @@ export function createProgram(): Command {
 
   registerLaunchCommand(program);
   registerBridgeCommand(program);
+  registerGatewayCommand(program);
   registerSetupCommand(program);
 
   for (const tool of TOOLS) {

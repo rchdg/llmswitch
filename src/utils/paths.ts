@@ -34,6 +34,34 @@ export function getBackupsDir(tool: Tool): string {
   return join(getToolStoreDir(tool), "backups");
 }
 
+export function getGatewayDir(): string {
+  return join(getAppConfigRoot(), "gateway");
+}
+
+export function getGatewayProvidersDir(): string {
+  return join(getGatewayDir(), "providers");
+}
+
+export function getGatewayProviderPath(name: string): string {
+  return join(getGatewayProvidersDir(), `${name}.json`);
+}
+
+export function getGatewayRoutesPath(): string {
+  return join(getGatewayDir(), "routes.json");
+}
+
+export function getGatewayConfigPath(): string {
+  return join(getGatewayDir(), "config.json");
+}
+
+export function getGatewayKeysPath(): string {
+  return join(getGatewayDir(), "keys.json");
+}
+
+export function getGatewayStatePath(): string {
+  return join(getGatewayDir(), "state.json");
+}
+
 export function getClaudeConfigDir(): string {
   return process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
 }

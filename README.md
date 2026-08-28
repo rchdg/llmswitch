@@ -146,6 +146,154 @@ llms bridge reload claude
 llms bridge reload codex --profile my-provider
 ```
 
+### 8. 对外提供 AI 网关
+
+Bridge 服务的是本机的 Claude Code / Codex / OpenCode。如果要让**第三方客户端**通过一个端口访问你配置的模型，用 gateway：
+
+```bash
+# 1. 准备供应商（可从已有工具配置导入，按上游去重）
+llms gateway provider import
+# 或手动添加（自动探测接口类型与模型列表）
+llms gateway provider add
+
+# 2. 创建网关 API Key（明文只显示一次，请立即保存）
+llms gateway key create --name my-app
+
+# 3. 启动网关
+llms gateway start
+
+# 4. 查看状态与可路由模型
+llms gateway status
+llms gateway models
+```
+
+默认监听 `127.0.0.1:17900`。第三方客户端直接把它当成 OpenAI 或 Anthropic 端点使用：
+
+```bash
+# OpenAI 格式
+curl http://127.0.0.1:17900/v1/chat/completions \
+  -H "Authorization: Bearer llmsk-..." \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}'
+
+# Anthropic 格式（同一个上游，网关自动转换）
+curl http://127.0.0.1:17900/v1/messages \
+  -H "x-api-key: llmsk-..." \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-chat","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+**任意入口格式 ↔ 任意上游格式**。三种入口（OpenAI Chat、OpenAI Responses、Anthropic Messages）与三种上游格式可自由组合，含流式与工具调用；入口与上游格式相同时原样透传，避免无谓的转换损耗。
+
+| 端点 | 说明 |
+| --- | --- |
+| `GET /v1/models` | 可路由模型列表（按 Key 作用域过滤） |
+| `POST /v1/chat/completions` | OpenAI Chat Completions |
+| `POST /v1/messages` | Anthropic Messages |
+| `POST /v1/messages/count_tokens` | Anthropic 上游走原生接口，其他上游本地计算（见下） |
+| `POST /v1/responses` | OpenAI Responses |
+| `POST /v1/embeddings` | 仅 OpenAI 兼容上游 |
+| `GET /health` | 存活探针（无需鉴权，不含任何配置信息） |
+
+**模型路由解析顺序**：
+
+1. 显式别名（`llms gateway route add`）
+2. 限定写法 `provider/model` 或 `provider:model`
+3. 裸模型 id（在某个 provider 的模型列表中）
+4. 未声明模型列表的 provider（作为 passthrough 兜底）
+5. `config set --default-provider` 指定的兜底供应商
+
+多个供应商提供同一模型时，按 `priority` 升序排列，自动构成 fallback 链：
+
+```bash
+# 别名 + 显式 fallback
+llms gateway route add gpt-4o --provider azure --model gpt-4o-2024-11 --fallback openrouter/openai/gpt-4o
+
+# 查看某个模型 id 的实际路由顺序
+llms gateway resolve gpt-4o
+```
+
+**Provider fallback**：上游返回 429/5xx 等可重试状态或连接失败时自动换下一个供应商。响应一旦开始写出（流式首帧之后）便不再切换，避免给客户端拼接两段不一致的输出。
+
+```bash
+llms gateway config set --fallback true --max-attempts 3 --retry-statuses 429,500,502,503,504
+```
+
+**API Key 管理**：仅存储哈希，支持吊销、过期与作用域限制。
+
+```bash
+# 限定供应商、模型、接口格式与速率
+llms gateway key create --name partner \
+  --providers deepseek --models deepseek-chat \
+  --formats openai-chat --rate-limit 60 --expires-in-days 30
+
+llms gateway key list
+llms gateway key revoke <id>
+```
+
+**限流**：计数持久化在 `gateway/rate-limit.json`，重启不丢失，多个网关进程共享同一份计数。响应会带标准限流头，客户端可据此自行退避：
+
+```
+X-RateLimit-Limit: 60
+X-RateLimit-Remaining: 59
+X-RateLimit-Reset: 1787894760
+Retry-After: 43          # 仅 429 时出现
+```
+
+```bash
+# 默认限额（Key 未单独设置时生效）
+llms gateway config set --rate-limit 120
+
+# 查看各 Key 当前窗口用量 / 清空计数
+llms gateway ratelimit show
+llms gateway ratelimit reset
+```
+
+计数文件读写有锁保护；极端争用下拿不到锁时会放行请求而非阻塞流量，宁可限额略松也不卡住线上调用。
+
+**Token 计数**：`count_tokens` 优先走上游原生接口（Anthropic 格式上游），拿不到时在本地计算并在 `llm_switch` 字段里说明来源：
+
+```json
+{
+  "input_tokens": 1234,
+  "llm_switch": {
+    "estimated": true,
+    "reason": "upstream_not_anthropic",
+    "method": "heuristic",
+    "breakdown": { "text": 30, "images": 1190, "tools": 0, "overhead": 14 }
+  }
+}
+```
+
+本地计算分两档：
+
+- `heuristic`（默认，无额外依赖）：按书写系统分别计数（中日韩、拉丁、数字各有不同的字符/token 比），再加上每条消息、每个工具 schema 与请求信封的结构开销。实测对中英日韩散文、JSON 与表情符号的平均绝对误差约 11%，且绝大多数样本偏高而非偏低——用于判断"这个请求装不装得下"时偏保守更安全。标点密集的源码是已知弱项，可能低估约 15%。
+- `tokenizer`（可选，精确）：装上 `gpt-tokenizer` 后自动启用，对 OpenAI 系编码是精确值，其他词表下也比启发式更接近。
+
+```bash
+# 需要精确计数时自行安装，llmswitch 不强制依赖它
+npm install -g gpt-tokenizer
+
+# 强制使用启发式
+export LLM_SWITCH_DISABLE_TOKENIZER=1
+```
+
+两档都会额外计入图片开销：从 base64 头部解析 PNG / JPEG / GIF / WebP 的真实像素尺寸，按 `宽 × 高 / 750` 折算；无法判定尺寸时（例如 URL 图片）按保守值计入。
+
+**对外暴露的安全要求**：默认只绑回环地址。绑到非回环地址必须显式传 `--allow-remote`，且至少存在一个有效 API Key，否则拒绝启动。
+
+```bash
+llms gateway start --host 0.0.0.0 --allow-remote
+```
+
+网关只提供明文 HTTP，请放在反向代理（Nginx / Caddy）后面终止 TLS，不要把裸 HTTP 直接暴露到公网。浏览器直连需显式开启 CORS：
+
+```bash
+llms gateway config set --cors-origins https://app.example.com
+```
+
+日志写入 `~/.config/llm-switch/gateway/gateway.log`，仅记录 Key 的 id，不记录明文或上游密钥。
+
 ---
 
 ## 常用命令
@@ -161,6 +309,11 @@ llms bridge reload codex --profile my-provider
 | `llms <tool> model` | 选择模型 |
 | `llms launch/run <tool> [model]` | 启动工具 |
 | `llms bridge status` | 查看 Bridge 状态 |
+| `llms gateway start` | 启动对外 AI 网关 |
+| `llms gateway provider import` | 从工具配置导入网关供应商 |
+| `llms gateway key create` | 创建网关 API Key |
+| `llms gateway status` | 查看网关状态 |
+| `llms gateway ratelimit show` | 查看各 Key 限流用量 |
 | `llms path` | 查看数据目录 |
 
 `<tool>` 可选 `claude`、`codex`、`opencode`。
@@ -179,6 +332,7 @@ llms launch --help
 | 数据 | 位置 |
 | --- | --- |
 | llmswitch 配置 | `~/.config/llm-switch/` |
+| 网关供应商 / Key / 日志 | `~/.config/llm-switch/gateway/` |
 | Claude Code | `~/.claude/settings.json` |
 | Codex | `~/.codex/config.toml` |
 | OpenCode | `~/.config/opencode/opencode.json` |
