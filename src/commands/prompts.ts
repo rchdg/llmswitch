@@ -1,5 +1,11 @@
 import * as p from "@clack/prompts";
-import type { ApiFormat, Profile, ProxyConfig, Tool } from "../types.js";
+import type {
+  ApiFormat,
+  ModelMeta,
+  Profile,
+  ProxyConfig,
+  Tool,
+} from "../types.js";
 import { normalizeProxyValue } from "../types.js";
 import { isApiFormat } from "../types.js";
 import { formatLabel, supportedFormats } from "../formats/compatibility.js";
@@ -15,6 +21,12 @@ import {
   fetchModelList,
   preferResolvedBaseUrl,
 } from "../utils/fetch-models.js";
+import {
+  collectModelMeta,
+  fetchModelMetadata,
+  lookupModelMeta,
+  type ModelMetadataCatalog,
+} from "../utils/model-metadata.js";
 import { normalizeBaseUrlForFormat } from "../utils/base-url.js";
 import { maskSecret } from "../utils/fs.js";
 
@@ -492,6 +504,7 @@ export async function promptProfileDraft(
     models: {
       default: defaultModel,
       list: Array.from(new Set(modelList)),
+      meta: resolved.modelMeta,
     },
     proxy,
     bridgeMode:
@@ -611,53 +624,103 @@ export type ResolveModelsResult = {
   modelList: string[];
   /** When /models succeeded on a different prefix (e.g. added /v1). */
   resolvedBaseUrl?: string;
+  /** Metadata (modalities/attachment) per model id from models.lonae.com. */
+  modelMeta?: Record<string, ModelMeta>;
 };
 
 /**
  * Fetch models from the provider API (when possible), then let the user
  * pick a default + a saved list. Falls back to manual text entry.
+ * Model metadata (modalities/attachment) is fetched from models.lonae.com
+ * while the model list is loading and attached to the final selection.
  */
 export async function resolveModelsInteractive(
   input: ResolveModelsInput,
 ): Promise<ResolveModelsResult> {
+  // Best-effort: fetch metadata in the background so it overlaps with /models.
+  const metaPromise = tryFetchModelMetadata(input);
+
   if (input.fixedDefault && input.fixedList?.length) {
     const list = [...input.fixedList];
     if (!list.includes(input.fixedDefault)) list.unshift(input.fixedDefault);
-    return { defaultModel: input.fixedDefault, modelList: list };
+    return {
+      defaultModel: input.fixedDefault,
+      modelList: list,
+      modelMeta: collectModelMeta(await metaPromise, list),
+    };
   }
 
   if (input.fixedDefault && !input.fixedList) {
     const fetched = await tryFetchModels(input);
-    if (fetched?.models.length) {
-      const list = Array.from(
-        new Set([input.fixedDefault, ...fetched.models]),
-      );
-      return {
-        defaultModel: input.fixedDefault,
-        modelList: list,
-        resolvedBaseUrl: fetched.resolvedBaseUrl,
-      };
-    }
+    const list = fetched?.models.length
+      ? Array.from(new Set([input.fixedDefault, ...fetched.models]))
+      : [input.fixedDefault];
     return {
       defaultModel: input.fixedDefault,
-      modelList: [input.fixedDefault],
+      modelList: list,
+      resolvedBaseUrl: fetched?.resolvedBaseUrl,
+      modelMeta: collectModelMeta(await metaPromise, list),
     };
   }
 
+  const catalog = await metaPromise;
   const fetched = await tryFetchModels(input);
 
   if (fetched && fetched.models.length > 0) {
-    const selected = await selectModelsFromFetched(fetched.models, input);
+    const selected = await selectModelsFromFetched(fetched.models, input, catalog);
     return { ...selected, resolvedBaseUrl: fetched.resolvedBaseUrl };
   }
 
-  return manualModelsEntry(input);
+  return manualModelsEntry(input, catalog);
+}
+
+/**
+ * Best-effort metadata fetch from models.lonae.com.
+ * Returns undefined (with a warning) when unreachable.
+ */
+async function tryFetchModelMetadata(
+  input: Pick<ResolveModelsInput, "proxy">,
+): Promise<ModelMetadataCatalog | undefined> {
+  try {
+    const catalog = await fetchModelMetadata({ proxy: input.proxy });
+    p.log.info(
+      `已从 models.lonae.com 获取 ${Object.keys(catalog.full).length} 个模型的元数据`,
+    );
+    return catalog;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    p.log.warn(`获取模型元数据失败（models.lonae.com）：${msg}`);
+    return undefined;
+  }
+}
+
+/** Human-readable modality hint for a model, e.g. "text/image → text · 支持附件". */
+function metadataHint(
+  modelId: string,
+  catalog: ModelMetadataCatalog | undefined,
+): string | undefined {
+  const meta = catalog ? lookupModelMeta(catalog, modelId) : undefined;
+  if (!meta) return undefined;
+  const parts: string[] = [];
+  if (meta.modalities) {
+    parts.push(
+      `${meta.modalities.input.join("/")} → ${meta.modalities.output.join("/")}`,
+    );
+  }
+  if (meta.attachment === true) parts.push("支持附件");
+  return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
+function joinHints(...hints: Array<string | undefined>): string | undefined {
+  const joined = hints.filter(Boolean).join(" · ");
+  return joined || undefined;
 }
 
 async function selectModelsFromFetched(
   fetched: string[],
   input: ResolveModelsInput,
-): Promise<{ defaultModel: string; modelList: string[] }> {
+  catalog: ModelMetadataCatalog | undefined,
+): Promise<{ defaultModel: string; modelList: string[]; modelMeta?: Record<string, ModelMeta> }> {
   const preferredDefault =
     (input.preferredDefault && fetched.includes(input.preferredDefault)
       ? input.preferredDefault
@@ -672,7 +735,10 @@ async function selectModelsFromFetched(
     options: fetched.map((id) => ({
       value: id,
       label: id,
-      hint: id === input.preferredDefault ? "当前" : undefined,
+      hint: joinHints(
+        id === input.preferredDefault ? "当前" : undefined,
+        metadataHint(id, catalog),
+      ),
     })),
     initialValue: preferredDefault,
   });
@@ -690,7 +756,10 @@ async function selectModelsFromFetched(
     options: fetched.map((id) => ({
       value: id,
       label: id,
-      hint: (input.preferredList || []).includes(id) ? "当前" : undefined,
+      hint: joinHints(
+        (input.preferredList || []).includes(id) ? "当前" : undefined,
+        metadataHint(id, catalog),
+      ),
     })),
     initialValues: Array.from(
       new Set([defaultModel, ...preferredList, ...presetList]),
@@ -703,12 +772,13 @@ async function selectModelsFromFetched(
   }
 
   const modelList = Array.from(new Set([defaultModel, ...picked]));
-  return { defaultModel, modelList };
+  return { defaultModel, modelList, modelMeta: collectModelMeta(catalog, modelList) };
 }
 
 async function manualModelsEntry(
   input: ResolveModelsInput,
-): Promise<{ defaultModel: string; modelList: string[] }> {
+  catalog: ModelMetadataCatalog | undefined,
+): Promise<ResolveModelsResult> {
   p.log.warn("未能自动获取模型列表，改为手动输入。");
 
   let defaultModel = input.fixedDefault || input.preferredDefault;
@@ -740,7 +810,11 @@ async function manualModelsEntry(
     modelList = [defaultModel, ...modelList];
   }
 
-  return { defaultModel, modelList };
+  return {
+    defaultModel,
+    modelList,
+    modelMeta: collectModelMeta(catalog, modelList),
+  };
 }
 
 export async function tryFetchModels(input: {

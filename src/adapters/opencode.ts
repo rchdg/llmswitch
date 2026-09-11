@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
-import type { ApiFormat, ApplyResult, Profile } from "../types.js";
+import type { ApiFormat, ApplyResult, ModelMeta, Profile } from "../types.js";
 import { assertCompatible } from "../formats/compatibility.js";
 import { normalizeBaseUrlForFormat } from "../utils/base-url.js";
 import { atomicWriteFile, backupFile, ensureDir } from "../utils/fs.js";
@@ -48,16 +48,40 @@ export function readOpenCodeAuth(path = getOpenCodeAuthPath()): JsonObject {
   return JSON.parse(readFileSync(path, "utf8")) as JsonObject;
 }
 
+/**
+ * Build one model entry for the OpenCode provider block. When metadata from
+ * models.lonae.com is available, expose the supported input/output modalities
+ * and attachment support, e.g.
+ * { "name": "id", "modalities": { "input": ["text","image"], "output": ["text"] }, "attachment": true }
+ */
+function buildOpenCodeModelEntry(id: string, meta?: ModelMeta): JsonObject {
+  const entry: JsonObject = { name: id };
+  if (meta?.modalities) {
+    entry.modalities = {
+      input: meta.modalities.input?.length ? meta.modalities.input : ["text"],
+      output: meta.modalities.output?.length ? meta.modalities.output : ["text"],
+    };
+  }
+  if (typeof meta?.attachment === "boolean") {
+    entry.attachment = meta.attachment;
+  }
+  return entry;
+}
+
 export function buildOpenCodeProviderBlock(
   profile: Profile,
   overrides?: { baseURL?: string; apiKey?: string },
 ): JsonObject {
+  const metaById = profile.models.meta || {};
   const models: JsonObject = {};
   for (const id of profile.models.list) {
-    models[id] = { name: id };
+    models[id] = buildOpenCodeModelEntry(id, metaById[id]);
   }
   if (!models[profile.models.default]) {
-    models[profile.models.default] = { name: profile.models.default };
+    models[profile.models.default] = buildOpenCodeModelEntry(
+      profile.models.default,
+      metaById[profile.models.default],
+    );
   }
 
   const options: JsonObject = {

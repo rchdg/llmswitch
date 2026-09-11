@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, unlinkSync } from "node:fs";
 import { readFileSync } from "node:fs";
-import type { Profile, Tool, ToolState } from "../types.js";
+import type { ModelMeta, Profile, Tool, ToolState } from "../types.js";
 import { isApiFormat, normalizeProxyValue } from "../types.js";
 import { normalizeBaseUrlForFormat } from "../utils/base-url.js";
 import { atomicWriteFile, ensureDir, maskSecret } from "../utils/fs.js";
@@ -12,6 +12,18 @@ import {
 } from "../utils/paths.js";
 
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+
+/** Keep only metadata entries whose model id is still in the list. */
+function filterModelMeta(
+  meta: Record<string, ModelMeta> | undefined,
+  list: readonly string[],
+): Record<string, ModelMeta> | undefined {
+  if (!meta) return undefined;
+  const filtered = Object.fromEntries(
+    Object.entries(meta).filter(([id]) => list.includes(id)),
+  );
+  return Object.keys(filtered).length > 0 ? filtered : undefined;
+}
 
 export function assertValidProfileName(name: string): void {
   if (!NAME_RE.test(name)) {
@@ -150,6 +162,7 @@ export function saveProfile(tool: Tool, profile: Profile): void {
         .map((m) => m!.trim()),
     ),
   );
+  const meta = filterModelMeta(profile.models.meta, list);
   const next: Profile = {
     ...profile,
     displayName: profile.displayName || profile.name,
@@ -159,6 +172,7 @@ export function saveProfile(tool: Tool, profile: Profile): void {
       default: profile.models.default.trim(),
       fast: profile.models.fast?.trim() || undefined,
       list,
+      meta,
     },
     headers: profile.headers || {},
     updatedAt: new Date().toISOString(),
@@ -281,6 +295,7 @@ function normalizeProfile(raw: Profile, fallbackName: string): Profile {
       default: raw.models?.default || list[0] || "",
       fast: raw.models?.fast || undefined,
       list: list.length ? list : raw.models?.default ? [raw.models.default] : [],
+      meta: filterModelMeta(raw.models?.meta, list),
     },
     proxy: normalizeProxyValue(raw.proxy),
     bridgeMode: raw.bridgeMode,

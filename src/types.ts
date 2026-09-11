@@ -14,10 +14,28 @@ export type ApiFormat = (typeof API_FORMATS)[number];
  */
 export type ProxyConfig = string;
 
+/** Input/output modality types supported by a model. */
+export interface ModelModalities {
+  input: string[];
+  output: string[];
+}
+
+/** Model metadata sourced from models.lonae.com (modalities, attachment…). */
+export interface ModelMeta {
+  /** Canonical model id on models.lonae.com, e.g. "anthropic/claude-sonnet-4-5". */
+  id?: string;
+  /** Display name, e.g. "Claude Sonnet 4.5". */
+  name?: string;
+  modalities?: ModelModalities;
+  attachment?: boolean;
+}
+
 export interface ModelsConfig {
   default: string;
   fast?: string;
   list: string[];
+  /** Metadata per model id, fetched from models.lonae.com during selection. */
+  meta?: Record<string, ModelMeta>;
 }
 
 export interface Profile {

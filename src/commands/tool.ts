@@ -454,6 +454,7 @@ async function configureProfileModels(
 
   profile.models.default = resolved.defaultModel;
   profile.models.list = resolved.modelList;
+  profile.models.meta = resolved.modelMeta;
   if (
     resolved.resolvedBaseUrl &&
     resolved.resolvedBaseUrl !== profile.baseUrl

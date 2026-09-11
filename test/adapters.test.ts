@@ -241,6 +241,36 @@ describe("opencode adapter", () => {
     expect(block.options.baseURL).toBe("http://127.0.0.1:8000/v1");
   });
 
+  test("model entries expose modalities and attachment from metadata", () => {
+    const profile = sample({
+      name: "meta",
+      apiFormat: "openai-chat",
+      models: {
+        default: "claude-3.7-sonnet",
+        list: ["claude-3.7-sonnet", "text-only-model"],
+        meta: {
+          "claude-3.7-sonnet": {
+            id: "anthropic/claude-3-7-sonnet",
+            name: "Claude 3.7 Sonnet",
+            modalities: { input: ["text", "image"], output: ["text"] },
+            attachment: true,
+          },
+        },
+      },
+    });
+    const cfg = buildOpenCodeConfig({}, profile);
+    const providers = cfg.provider as Record<string, Record<string, unknown>>;
+    const block = providers["llms-meta"] as {
+      models: Record<string, Record<string, unknown>>;
+    };
+    expect(block.models["claude-3.7-sonnet"]).toEqual({
+      name: "claude-3.7-sonnet",
+      modalities: { input: ["text", "image"], output: ["text"] },
+      attachment: true,
+    });
+    expect(block.models["text-only-model"]).toEqual({ name: "text-only-model" });
+  });
+
   test("apply writes config", async () => {
     const profile = sample({ name: "or", apiFormat: "anthropic" });
     saveProfile("opencode", profile);
