@@ -207,6 +207,28 @@ describe("codex adapter", () => {
     expect(existsSync(result.configPath)).toBe(true);
     expect(existsSync(join(process.env.CODEX_HOME!, ".env"))).toBe(true);
   });
+
+  test("model_context_window written from metadata and cleared without it", () => {
+    const withMeta = sample({
+      name: "gw",
+      apiFormat: "openai-responses",
+      models: {
+        default: "gpt-5.5",
+        list: ["gpt-5.5"],
+        meta: { "gpt-5.5": { id: "openai/gpt-5.5", context: 400000 } },
+      },
+    });
+    const cfg = buildCodexConfig({}, withMeta, "https://api.example.com/v1");
+    expect(cfg.model_context_window).toBe(400000);
+
+    const withoutMeta = sample({ name: "gw2", apiFormat: "openai-responses" });
+    const cfg2 = buildCodexConfig(
+      { model_context_window: 12345 },
+      withoutMeta,
+      "https://api.example.com/v1",
+    );
+    expect(cfg2.model_context_window).toBeUndefined();
+  });
 });
 
 describe("opencode adapter", () => {
@@ -241,7 +263,7 @@ describe("opencode adapter", () => {
     expect(block.options.baseURL).toBe("http://127.0.0.1:8000/v1");
   });
 
-  test("model entries expose modalities and attachment from metadata", () => {
+  test("model entries expose full metadata for opencode schema", () => {
     const profile = sample({
       name: "meta",
       apiFormat: "openai-chat",
@@ -252,8 +274,16 @@ describe("opencode adapter", () => {
           "claude-3.7-sonnet": {
             id: "anthropic/claude-3-7-sonnet",
             name: "Claude 3.7 Sonnet",
+            family: "claude-3-7",
+            releaseDate: "2025-02-19",
+            context: 200000,
+            maxOutput: 64000,
+            reasoning: true,
+            toolCall: true,
+            temperature: true,
             modalities: { input: ["text", "image"], output: ["text"] },
             attachment: true,
+            cost: { input: 3, output: 15 },
           },
         },
       },
@@ -264,11 +294,46 @@ describe("opencode adapter", () => {
       models: Record<string, Record<string, unknown>>;
     };
     expect(block.models["claude-3.7-sonnet"]).toEqual({
-      name: "claude-3.7-sonnet",
+      name: "Claude 3.7 Sonnet",
+      family: "claude-3-7",
+      release_date: "2025-02-19",
+      limit: { context: 200000, output: 64000 },
+      cost: { input: 3, output: 15 },
       modalities: { input: ["text", "image"], output: ["text"] },
       attachment: true,
+      reasoning: true,
+      temperature: true,
+      tool_call: true,
     });
-    expect(block.models["text-only-model"]).toEqual({ name: "text-only-model" });
+    expect(block.models["text-only-model"]).toEqual({
+      name: "text-only-model",
+    });
+  });
+
+  test("model entry falls back to id as name when metadata lacks it", () => {
+    const profile = sample({
+      name: "meta2",
+      apiFormat: "openai-chat",
+      models: {
+        default: "model-a",
+        list: ["model-a"],
+        meta: {
+          "model-a": {
+            id: "lab/model-a",
+            modalities: { input: ["text"], output: ["text"] },
+          },
+        },
+      },
+    });
+    const cfg = buildOpenCodeConfig({}, profile);
+    const providers = cfg.provider as Record<string, Record<string, unknown>>;
+    const block = providers["llms-meta2"] as {
+      models: Record<string, Record<string, unknown>>;
+    };
+    expect(block.models["model-a"]).toEqual({
+      name: "model-a",
+      modalities: { input: ["text"], output: ["text"] },
+    });
   });
 
   test("apply writes config", async () => {

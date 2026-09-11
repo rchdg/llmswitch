@@ -20,14 +20,38 @@ export interface ModelModalities {
   output: string[];
 }
 
-/** Model metadata sourced from models.lonae.com (modalities, attachment…). */
+/** Pricing per 1M tokens. */
+export interface ModelCost {
+  input: number;
+  output: number;
+}
+
+/**
+ * Model metadata sourced from models.lonae.com. Only fields relevant to the
+ * target tools' config schemas are captured (see adapters).
+ */
 export interface ModelMeta {
   /** Canonical model id on models.lonae.com, e.g. "anthropic/claude-sonnet-4-5". */
   id?: string;
   /** Display name, e.g. "Claude Sonnet 4.5". */
   name?: string;
+  /** Model family, e.g. "claude-sonnet-4". */
+  family?: string;
+  /** Release date, e.g. "2025-09-29". */
+  releaseDate?: string;
+  /** Context window in tokens. */
+  context?: number;
+  /** Maximum output tokens. */
+  maxOutput?: number;
+  /** Supports reasoning/thinking. */
+  reasoning?: boolean;
+  /** Supports tool/function calling. */
+  toolCall?: boolean;
+  /** Supports temperature control. */
+  temperature?: boolean;
   modalities?: ModelModalities;
   attachment?: boolean;
+  cost?: ModelCost;
 }
 
 export interface ModelsConfig {

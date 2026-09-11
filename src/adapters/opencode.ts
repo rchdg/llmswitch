@@ -49,13 +49,26 @@ export function readOpenCodeAuth(path = getOpenCodeAuthPath()): JsonObject {
 }
 
 /**
- * Build one model entry for the OpenCode provider block. When metadata from
- * models.lonae.com is available, expose the supported input/output modalities
- * and attachment support, e.g.
- * { "name": "id", "modalities": { "input": ["text","image"], "output": ["text"] }, "attachment": true }
+ * Build one model entry for the OpenCode provider block, filling in every
+ * per-model field the OpenCode schema supports when metadata from
+ * models.lonae.com is available:
+ * { name, family, release_date, limit, cost, modalities, attachment,
+ *   reasoning, temperature, tool_call }
  */
 function buildOpenCodeModelEntry(id: string, meta?: ModelMeta): JsonObject {
-  const entry: JsonObject = { name: id };
+  const entry: JsonObject = { name: meta?.name || id };
+  if (meta?.family) {
+    entry.family = meta.family;
+  }
+  if (meta?.releaseDate) {
+    entry.release_date = meta.releaseDate;
+  }
+  if (typeof meta?.context === "number" && typeof meta?.maxOutput === "number") {
+    entry.limit = { context: meta.context, output: meta.maxOutput };
+  }
+  if (meta?.cost) {
+    entry.cost = { input: meta.cost.input, output: meta.cost.output };
+  }
   if (meta?.modalities) {
     entry.modalities = {
       input: meta.modalities.input?.length ? meta.modalities.input : ["text"],
@@ -64,6 +77,15 @@ function buildOpenCodeModelEntry(id: string, meta?: ModelMeta): JsonObject {
   }
   if (typeof meta?.attachment === "boolean") {
     entry.attachment = meta.attachment;
+  }
+  if (typeof meta?.reasoning === "boolean") {
+    entry.reasoning = meta.reasoning;
+  }
+  if (typeof meta?.temperature === "boolean") {
+    entry.temperature = meta.temperature;
+  }
+  if (typeof meta?.toolCall === "boolean") {
+    entry.tool_call = meta.toolCall;
   }
   return entry;
 }

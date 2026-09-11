@@ -30,6 +30,20 @@ export function envKeyName(profileName: string): string {
   return `LLM_SWITCH_${key}_API_KEY`;
 }
 
+/**
+ * Model-level metadata Codex accepts in config.toml. Only `model_context_window`
+ * is a stable model-info key (schema is deny_unknown_fields — never write
+ * removed keys like model_max_output_tokens).
+ */
+function applyModelInfo(config: TomlTable, profile: Profile): void {
+  const context = profile.models.meta?.[profile.models.default]?.context;
+  if (typeof context === "number" && context > 0) {
+    config.model_context_window = Math.round(context);
+  } else {
+    delete config.model_context_window;
+  }
+}
+
 export function readCodexConfig(path = getCodexConfigPath()): TomlTable {
   if (!existsSync(path)) return {};
   return parse(readFileSync(path, "utf8")) as TomlTable;
@@ -64,12 +78,14 @@ export function buildCodexConfig(
 
   providers[id] = providerBlock;
 
-  return {
+  const next: TomlTable = {
     ...existing,
     model: profile.models.default,
     model_provider: id,
     model_providers: providers,
   };
+  applyModelInfo(next, profile);
+  return next;
 }
 
 export function buildCodexEnvFile(
@@ -227,10 +243,12 @@ export async function deactivateCodexProfile(
     if (next.model_provider === id) {
       delete next.model_provider;
       delete next.model;
+      delete next.model_context_window;
     }
   } else if (next.model_provider) {
     delete next.model_provider;
     delete next.model;
+    delete next.model_context_window;
   }
   next.model_providers = providers;
   atomicWriteFile(configPath, stringify(next) + "\n");

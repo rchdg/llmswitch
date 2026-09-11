@@ -10,13 +10,36 @@ export interface ModelModalities {
   output: string[];
 }
 
+export interface ModelCost {
+  /** USD per 1M input tokens. */
+  input: number;
+  /** USD per 1M output tokens. */
+  output: number;
+}
+
 export interface ModelMeta {
   /** Canonical model id on models.lonae.com, e.g. "anthropic/claude-sonnet-4-5". */
   id?: string;
   /** Display name, e.g. "Claude Sonnet 4.5". */
   name?: string;
+  /** Model family, e.g. "claude-sonnet-4". */
+  family?: string;
+  /** Release date, e.g. "2025-09-29". */
+  releaseDate?: string;
+  /** Context window in tokens. */
+  context?: number;
+  /** Maximum output tokens. */
+  maxOutput?: number;
+  /** Supports reasoning/thinking. */
+  reasoning?: boolean;
+  /** Supports tool/function calling. */
+  toolCall?: boolean;
+  /** Supports temperature control. */
+  temperature?: boolean;
   modalities?: ModelModalities;
   attachment?: boolean;
+  /** Pricing per 1M tokens. */
+  cost?: ModelCost;
 }
 /** Metadata index keyed by full id, bare id, and normalized variants. */
 export interface ModelMetadataCatalog {
@@ -75,6 +98,18 @@ function parseModalities(row: Record<string, unknown>): ModelModalities | undefi
   };
 }
 
+function asNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function parseCost(row: Record<string, unknown>): ModelCost | undefined {
+  const input = asNumber(row.priceInput);
+  const output = asNumber(row.priceOutput);
+  return input !== undefined && output !== undefined
+    ? { input, output }
+    : undefined;
+}
+
 /** Insert into a normalized bucket, preferring undated ids as canonical. */
 function indexNorm(
   bucket: Record<string, ModelMeta>,
@@ -114,8 +149,22 @@ export function parseModelMetadata(payload: unknown): ModelMetadataCatalog {
     const meta: ModelMeta = {
       id,
       name: typeof row.name === "string" && row.name.trim() ? row.name.trim() : undefined,
+      family:
+        typeof row.family === "string" && row.family.trim()
+          ? row.family.trim()
+          : undefined,
+      releaseDate:
+        typeof row.releaseDate === "string" && row.releaseDate.trim()
+          ? row.releaseDate.trim()
+          : undefined,
+      context: asNumber(row.context),
+      maxOutput: asNumber(row.output),
+      reasoning: typeof row.reasoning === "boolean" ? row.reasoning : undefined,
+      toolCall: typeof row.toolCall === "boolean" ? row.toolCall : undefined,
+      temperature: typeof row.temperature === "boolean" ? row.temperature : undefined,
       modalities: parseModalities(row),
       attachment: typeof row.attachment === "boolean" ? row.attachment : undefined,
+      cost: parseCost(row),
     };
 
     const bareIndex = id.indexOf("/");

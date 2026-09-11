@@ -12,8 +12,17 @@ const SAMPLE_PAYLOAD = {
     {
       id: "anthropic/claude-3-7-sonnet",
       name: "Claude 3.7 Sonnet",
+      family: "claude-3-7",
+      releaseDate: "2025-02-19",
+      context: 200000,
+      output: 64000,
+      reasoning: true,
+      toolCall: true,
+      temperature: true,
       modalities: { input: ["text", "image", "pdf"], output: ["text"] },
       attachment: true,
+      priceInput: 3,
+      priceOutput: 15,
     },
     {
       id: "openai/gpt-5.5",
@@ -21,6 +30,11 @@ const SAMPLE_PAYLOAD = {
       inputModalities: ["text", "image"],
       outputModalities: ["text"],
       attachment: false,
+      context: 400000,
+      output: 128000,
+      reasoning: true,
+      toolCall: true,
+      priceInput: 1.25,
     },
     {
       id: "meta/llama-4-scout",
@@ -40,6 +54,19 @@ describe("parseModelMetadata", () => {
     );
   });
 
+  test("parses capability, limit, and pricing fields", () => {
+    const catalog = parseModelMetadata(SAMPLE_PAYLOAD);
+    const meta = catalog.full["anthropic/claude-3-7-sonnet"];
+    expect(meta?.family).toBe("claude-3-7");
+    expect(meta?.releaseDate).toBe("2025-02-19");
+    expect(meta?.context).toBe(200000);
+    expect(meta?.maxOutput).toBe(64000);
+    expect(meta?.reasoning).toBe(true);
+    expect(meta?.toolCall).toBe(true);
+    expect(meta?.temperature).toBe(true);
+    expect(meta?.cost).toEqual({ input: 3, output: 15 });
+  });
+
   test("accepts inputModalities/outputModalities fallback fields", () => {
     const catalog = parseModelMetadata(SAMPLE_PAYLOAD);
     const meta = catalog.full["openai/gpt-5.5"];
@@ -48,6 +75,7 @@ describe("parseModelMetadata", () => {
       output: ["text"],
     });
     expect(meta?.attachment).toBe(false);
+    expect(meta?.cost).toBeUndefined();
   });
 
   test("non-object payloads yield an empty catalog", () => {
