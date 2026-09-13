@@ -35,6 +35,7 @@ import {
   forceCompleteStream,
   parseChatSseLine as parseChatSseLineResponses,
 } from "./translate-response.js";
+import { modelItemId, modelsFromPayload } from "../utils/fetch-models.js";
 
 export interface BridgeServerOptions {
   controlToken?: string;
@@ -211,8 +212,7 @@ async function fetchModelsJson(
   }
   try {
     const json = (await response.json()) as Record<string, unknown>;
-    const data = Array.isArray(json.data) ? json.data : [];
-    return { ok: true, status: 200, data: data as unknown[] };
+    return { ok: true, status: 200, data: modelsFromPayload(json) };
   } catch {
     return { ok: false, status: 502, data: [] };
   }
@@ -245,13 +245,14 @@ async function proxyModelsMerged(
   for (const result of results) {
     if (!result.ok) continue;
     for (const item of result.data) {
-      const id =
-        item && typeof item === "object" && "id" in item
-          ? String((item as { id: unknown }).id)
-          : "";
+      const id = modelItemId(item);
       if (!id || seen.has(id)) continue;
       seen.add(id);
-      merged.push(item);
+      const row =
+        item && typeof item === "object"
+          ? (item as Record<string, unknown>)
+          : {};
+      merged.push(row.id ? item : { ...row, id });
     }
   }
   if (!merged.length && results.every((r) => !r.ok)) {

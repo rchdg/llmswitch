@@ -101,27 +101,39 @@ export function buildModelsRequestHeaders(
   return headers;
 }
 
-export function parseModelIds(payload: unknown): string[] {
+/**
+ * Extract a model identifier from a list item. Providers disagree on the field
+ * name: OpenAI uses `id`, some gateways `name`/`model`, and Codex-style
+ * catalogs (e.g. BigModel) use `slug`.
+ */
+export function modelItemId(item: unknown): string {
+  if (typeof item === "string") return item.trim();
+  if (!item || typeof item !== "object") return "";
+  const row = item as Record<string, unknown>;
+  const id = row.id ?? row.name ?? row.model ?? row.slug;
+  return typeof id === "string" ? id.trim() : "";
+}
+
+/**
+ * Collect the model-array buckets from a /models payload, accepting the common
+ * `data` and `models` shapes plus a bare array.
+ */
+export function modelsFromPayload(payload: unknown): unknown[] {
   if (!payload || typeof payload !== "object") return [];
   const root = payload as Record<string, unknown>;
-
   const buckets: unknown[] = [];
   if (Array.isArray(root.data)) buckets.push(...root.data);
   if (Array.isArray(root.models)) buckets.push(...root.models);
   if (Array.isArray(payload)) buckets.push(...payload);
+  return buckets;
+}
 
+export function parseModelIds(payload: unknown): string[] {
   const ids = new Set<string>();
-  for (const item of buckets) {
-    if (typeof item === "string" && item.trim()) {
-      ids.add(item.trim());
-      continue;
-    }
-    if (!item || typeof item !== "object") continue;
-    const row = item as Record<string, unknown>;
-    const id = row.id ?? row.name ?? row.model;
-    if (typeof id === "string" && id.trim()) ids.add(id.trim());
+  for (const item of modelsFromPayload(payload)) {
+    const id = modelItemId(item);
+    if (id) ids.add(id);
   }
-
   return Array.from(ids).sort((a, b) => a.localeCompare(b));
 }
 

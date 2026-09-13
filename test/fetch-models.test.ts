@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import {
   buildModelsRequestHeaders,
   baseUrlFromModelsEndpoint,
+  modelItemId,
   modelListEndpoints,
+  modelsFromPayload,
   parseModelIds,
   preferResolvedBaseUrl,
 } from "../src/utils/fetch-models.ts";
@@ -60,6 +62,30 @@ describe("preferResolvedBaseUrl", () => {
   });
 });
 
+describe("modelItemId", () => {
+  test("accepts id, name, model and slug", () => {
+    expect(modelItemId({ id: "a" })).toBe("a");
+    expect(modelItemId({ name: "b" })).toBe("b");
+    expect(modelItemId({ model: "c" })).toBe("c");
+    expect(modelItemId({ slug: "d" })).toBe("d");
+    expect(modelItemId("e")).toBe("e");
+    expect(modelItemId({ foo: "bar" })).toBe("");
+  });
+
+  test("prefers id over other fields", () => {
+    expect(modelItemId({ id: "a", slug: "b" })).toBe("a");
+  });
+});
+
+describe("modelsFromPayload", () => {
+  test("reads data, models and bare arrays", () => {
+    expect(modelsFromPayload({ data: [1] })).toEqual([1]);
+    expect(modelsFromPayload({ models: [2] })).toEqual([2]);
+    expect(modelsFromPayload([3])).toEqual([3]);
+    expect(modelsFromPayload({ foo: 1 })).toEqual([]);
+  });
+});
+
 describe("parseModelIds", () => {
   test("openai data array", () => {
     expect(
@@ -79,6 +105,17 @@ describe("parseModelIds", () => {
 
   test("string array and models key", () => {
     expect(parseModelIds({ models: ["a", "b"] })).toEqual(["a", "b"]);
+  });
+
+  test("bigmodel models array uses slug", () => {
+    expect(
+      parseModelIds({
+        models: [
+          { slug: "glm-5.3", display_name: "GLM-5.3" },
+          { slug: "glm-5-turbo", display_name: "GLM-5 Turbo" },
+        ],
+      }),
+    ).toEqual(["glm-5-turbo", "glm-5.3"]);
   });
 });
 
