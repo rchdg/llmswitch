@@ -91,6 +91,21 @@ llms codex model --profile my-provider
 
 With an API key, it automatically fetches the upstream model list. You can also manually enter model IDs.
 
+Claude Code and OpenCode support a second, lightweight model alongside the default one, used for cheap tasks like title generation and summarization. After picking the default model you get one extra step, "select a lightweight model"; choosing "not set" falls back to the default model:
+
+```bash
+# Interactive (default model → enabled models → lightweight model)
+llms opencode model
+
+# Set it directly, skipping the lightweight-model prompt
+llms opencode model --small glm-4.5-air
+
+# Clear a configured lightweight model
+llms opencode model --small ""
+```
+
+The lightweight model is written to each tool's own setting: OpenCode gets a top-level `small_model`, Claude Code gets `ANTHROPIC_SMALL_FAST_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL`. Codex has no equivalent knob, so the option is not offered there.
+
 ### 4. Enable Configuration
 
 ```bash
@@ -118,6 +133,12 @@ llms launch claude --profile my-provider --model claude-sonnet-4
 
 When `--profile` is not specified, it automatically selects the configuration that contains the target model.
 
+A model passed on the command line applies to that launch only and does not modify the saved provider configuration (so a typo cannot silently become your new default). Add `--save` to make it the provider's new default:
+
+```bash
+llms launch codex gpt-4.1 --save
+```
+
 ### 6. Preview Execution Plan
 
 ```bash
@@ -128,9 +149,26 @@ llms launch codex gpt-4.1 --dry-run
 llms launch codex gpt-4.1 --dry-run --json
 ```
 
-### 7. Manage Local Bridge
+### 7. Non-Interactive Use (Scripts / CI)
 
-When Claude Code or Codex uses a non-native protocol, a local Bridge starts automatically.
+Besides the interactive menu, provider management is fully scriptable. With all arguments supplied there are no prompts:
+
+```bash
+# Add and enable (--no-enable saves without enabling)
+llms opencode provider add \
+  --base-url https://api.example.com/v1 --api-key sk-xxx \
+  --name myprov --model glm-4.6 --small glm-4.5-air --json
+
+# List and remove
+llms opencode provider list --json
+llms opencode provider rm myprov --yes
+```
+
+Every interactive command fails fast with the flag to use instead when stdin is not a TTY, rather than silently waiting for input.
+
+### 8. Manage Local Bridge
+
+When Claude Code, Codex or OpenCode uses a non-native protocol, a local Bridge starts automatically.
 
 ```bash
 # View Bridge status
@@ -143,9 +181,10 @@ llms bridge stop
 # Reload configuration
 llms bridge reload claude
 llms bridge reload codex --profile my-provider
+llms bridge reload opencode
 ```
 
-### 8. Serve an Outward-Facing AI Gateway
+### 9. Serve an Outward-Facing AI Gateway
 
 The Bridge serves Claude Code / Codex / OpenCode on your own machine. To let
 **third-party clients** reach your configured models through a single port, use
@@ -271,7 +310,7 @@ llms gateway key create --name partner \
   --daily-requests 5000
 
 llms gateway key list
-llms gateway key edit <id> --rate-limit 120          # limits / scopes / expiry
+llms gateway key edit <id> --rate-limit 120 --daily-requests 8000   # limits / scopes / expiry
 llms gateway key rotate <id>                          # new plaintext, old key dies
 llms gateway key revoke <id>
 ```
@@ -383,7 +422,7 @@ environment variables shared with the Bridge:
 | `LLM_SWITCH_IDLE_TIMEOUT_MS` | 90000 | Streaming idle timeout |
 | `LLM_SWITCH_TOTAL_TIMEOUT_MS` | 600000 | Total timeout per request |
 
-`llms gateway config show` also prints the effective values.
+`llms gateway config show` also prints the effective values (add `--json` for structured output). These limits apply to both the gateway and the Bridge.
 
 **Exposure safety**: the gateway binds to loopback by default. Binding to a
 non-loopback address requires `--allow-remote` *and* at least one active API
@@ -411,11 +450,12 @@ llms gateway config set --cors-origins https://app.example.com
 | `llms` | Pick a tool and launch (auto-guides when not configured) |
 | `llms <tool>` | Launch the tool directly (auto-guides through full flow when not configured) |
 | `llms setup [--tool <tool>]` | Explicit guided setup (provider → models → enable → launch) |
-| `llms <tool> provider` | Manage provider configurations (add, view, edit, delete) |
+| `llms <tool> provider` | Interactive provider management (add, view, edit, delete) |
+| `llms <tool> provider list/add/rm` | Non-interactive add/list/remove (scripts / CI) |
 | `llms <tool> use [name]` | Enable specified configuration |
 | `llms <tool> current` | View current configuration |
 | `llms <tool> model` | Select models |
-| `llms launch/run <tool> [model]` | Launch tool |
+| `llms launch/run <tool> [model]` | Launch tool (add `--save` to change the default model) |
 | `llms bridge status` | View Bridge status |
 | `llms gateway start` | Start the outward-facing AI gateway |
 | `llms gateway provider import` | Import gateway providers from tool configs |
@@ -445,9 +485,12 @@ llms launch --help
 | --- | --- |
 | llmswitch config | `~/.config/llm-switch/` |
 | Gateway providers / keys / logs | `~/.config/llm-switch/gateway/` |
+| Automatic pre-write backups | `~/.config/llm-switch/<tool>/backups/` (latest 10 per kind) |
 | Claude Code | `~/.claude/settings.json` |
 | Codex | `~/.codex/config.toml` |
 | OpenCode | `~/.config/opencode/opencode.json` |
+
+The original file is backed up before any write. Backups contain plaintext API keys, so only the 10 most recent per kind are kept. If a target config file has broken syntax, the command reports the exact file path instead of crashing.
 
 View actual path:
 

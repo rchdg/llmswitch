@@ -92,6 +92,21 @@ llms codex model --profile my-provider
 
 有 API Key 时会自动获取上游模型列表，也可手动输入模型 ID。
 
+Claude Code 与 OpenCode 支持在默认模型之外再配一个轻量小模型，用于标题生成、总结这类低成本任务。选完默认模型后会多问一步「选择轻量小模型」，选「不设置」则沿用默认模型：
+
+```bash
+# 交互选择（默认模型 → 启用模型 → 轻量小模型）
+llms opencode model
+
+# 直接指定，跳过小模型的交互
+llms opencode model --small glm-4.5-air
+
+# 清除已配置的小模型
+llms opencode model --small ""
+```
+
+小模型会写入各工具自己的配置项：OpenCode 写顶层 `small_model`，Claude Code 写 `ANTHROPIC_SMALL_FAST_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL`。Codex 没有对应开关，因此不提供该选项。
+
 ### 4. 启用配置
 
 ```bash
@@ -119,6 +134,12 @@ llms launch claude --profile my-provider --model claude-sonnet-4
 
 未指定 `--profile` 时，会自动选择包含目标模型的配置。
 
+命令行上给出的模型只作用于本次启动，不会改动已保存的供应商配置（避免打错一个模型名就把它变成默认模型）。要让它成为该供应商的新默认模型，显式加 `--save`：
+
+```bash
+llms launch codex gpt-4.1 --save
+```
+
 ### 6. 预览执行计划
 
 ```bash
@@ -129,9 +150,26 @@ llms launch codex gpt-4.1 --dry-run
 llms launch codex gpt-4.1 --dry-run --json
 ```
 
-### 7. 管理本地 Bridge
+### 7. 非交互使用（脚本 / CI）
 
-Claude Code 或 Codex 使用非原生协议时，会自动启动本地 Bridge。
+供应商管理除交互菜单外，也提供可脚本化的子命令。参数齐全时不会出现任何提示：
+
+```bash
+# 添加并启用（--no-enable 则只保存不启用）
+llms opencode provider add \
+  --base-url https://api.example.com/v1 --api-key sk-xxx \
+  --name myprov --model glm-4.6 --small glm-4.5-air --json
+
+# 列出与删除
+llms opencode provider list --json
+llms opencode provider rm myprov --yes
+```
+
+所有交互式命令在 stdin 不是 TTY 时会立即报错并提示对应参数，而不是静默等待输入。
+
+### 8. 管理本地 Bridge
+
+Claude Code、Codex 或 OpenCode 使用非原生协议时，会自动启动本地 Bridge。
 
 ```bash
 # 查看 Bridge 状态
@@ -141,12 +179,13 @@ llms bridge status
 llms bridge start
 llms bridge stop
 
-# 重载配置
+# 重载配置（三个工具都支持）
 llms bridge reload claude
 llms bridge reload codex --profile my-provider
+llms bridge reload opencode
 ```
 
-### 8. 对外提供 AI 网关
+### 9. 对外提供 AI 网关
 
 Bridge 服务的是本机的 Claude Code / Codex / OpenCode。如果要让**第三方客户端**通过一个端口访问你配置的模型，用 gateway：
 
@@ -255,7 +294,7 @@ llms gateway key create --name partner \
   --daily-requests 5000
 
 llms gateway key list
-llms gateway key edit <id> --rate-limit 120          # 改限额/作用域/续期
+llms gateway key edit <id> --rate-limit 120 --daily-requests 8000   # 改限额/作用域/续期
 llms gateway key rotate <id>                          # 换发明文，旧 Key 立即失效
 llms gateway key revoke <id>
 ```
@@ -340,7 +379,7 @@ llms gateway logs --follow     # 持续跟踪
 | `LLM_SWITCH_IDLE_TIMEOUT_MS` | 90000 | 流式空闲超时 |
 | `LLM_SWITCH_TOTAL_TIMEOUT_MS` | 600000 | 单请求总超时 |
 
-`llms gateway config show` 会一并显示当前生效值。
+`llms gateway config show` 会一并显示当前生效值（加 `--json` 可拿结构化输出）。这些限额对 gateway 与 Bridge 同时生效。
 
 **对外暴露的安全要求**：默认只绑回环地址。绑到非回环地址必须显式传 `--allow-remote`，且至少存在一个有效 API Key，否则拒绝启动。
 
@@ -365,11 +404,12 @@ llms gateway config set --cors-origins https://app.example.com
 | `llms` | 选择工具并启动（未配置时自动引导） |
 | `llms <tool>` | 直接启动工具（未配置时自动引导完整链路） |
 | `llms setup [--tool <tool>]` | 显式引导配置（添加供应商 → 模型 → 启用 → 启动） |
-| `llms <tool> provider` | 管理供应商配置（添加、查看、编辑、删除） |
+| `llms <tool> provider` | 交互管理供应商（添加、查看、编辑、删除） |
+| `llms <tool> provider list/add/rm` | 非交互增删查（脚本 / CI 用） |
 | `llms <tool> use [name]` | 启用指定配置 |
 | `llms <tool> current` | 查看当前配置 |
 | `llms <tool> model` | 选择模型 |
-| `llms launch/run <tool> [model]` | 启动工具 |
+| `llms launch/run <tool> [model]` | 启动工具（加 `--save` 才改默认模型） |
 | `llms bridge status` | 查看 Bridge 状态 |
 | `llms gateway start` | 启动对外 AI 网关 |
 | `llms gateway provider import` | 从工具配置导入网关供应商 |
@@ -399,9 +439,12 @@ llms launch --help
 | --- | --- |
 | llmswitch 配置 | `~/.config/llm-switch/` |
 | 网关供应商 / Key / 日志 | `~/.config/llm-switch/gateway/` |
+| 写入前的自动备份 | `~/.config/llm-switch/<tool>/backups/`（每类保留最近 10 份） |
 | Claude Code | `~/.claude/settings.json` |
 | Codex | `~/.codex/config.toml` |
 | OpenCode | `~/.config/opencode/opencode.json` |
+
+修改这些工具的配置前会先备份原文件；备份含明文 API Key，因此按类别只保留最近 10 份。若目标配置文件语法损坏，命令会报出具体文件路径而不是崩溃。
 
 查看实际路径：
 
