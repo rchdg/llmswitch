@@ -2,14 +2,20 @@
  * Per-day usage accounting for the gateway data plane.
  *
  * One JSON file with daily buckets; each row aggregates requests and token
- * counts for a (key, provider, model) triple. Writes are read-modify-write via
- * the same atomic-replace pattern as the rest of the store — the daemon is the
- * single writer in practice, so no lock is taken and a crashed process can lose
- * at most the in-flight update.
+ * counts for a (key, provider, model) triple.
+ *
+ * The read-modify-write runs under the same kind of advisory file lock as the
+ * rate-limit counters. A foreground `gateway serve` and a daemon can be up at
+ * the same time (both record usage), and since each write atomically replaces
+ * the whole file, an unlocked update would silently discard the other process's
+ * accounting. Losing the lock race degrades to "skip this record" rather than
+ * blocking a live request.
  */
 
 import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { atomicWriteFile, ensureDir } from "../utils/fs.js";
+import { acquireFileLock } from "../utils/file-lock.js";
 import { getGatewayDir, getGatewayUsagePath } from "../utils/paths.js";
 
 const RETENTION_DAYS = 90;
@@ -67,6 +73,10 @@ function nonNegativeNumber(value: unknown): number {
 
 export function getUsagePath(): string {
   return getGatewayUsagePath();
+}
+
+export function getUsageLockPath(): string {
+  return join(getGatewayDir(), "usage.lock");
 }
 
 function dayKey(now = Date.now()): string {
@@ -154,6 +164,9 @@ function mergeRow(
 
 /** Best-effort: accounting failures must never break a live request. */
 export function recordUsage(record: UsageRecordInput, now = Date.now()): void {
+  // 拿不到锁就放弃这一条统计：宁可少记一次，也不要覆盖掉另一个进程的整份账。
+  const lock = acquireFileLock(getUsageLockPath(), { timeoutMs: 200 }, now);
+  if (!lock) return;
   try {
     const file = readUsage();
     const day = dayKey(now);
@@ -163,6 +176,8 @@ export function recordUsage(record: UsageRecordInput, now = Date.now()): void {
     writeUsage(file, now);
   } catch {
     // Non-fatal.
+  } finally {
+    lock.release();
   }
 }
 
@@ -195,9 +210,12 @@ export function summarizeUsage(
 
 /** Drop every recorded usage (test seam and `llms gateway usage reset`). */
 export function resetUsage(): void {
+  const lock = acquireFileLock(getUsageLockPath(), { timeoutMs: 200 });
   try {
     atomicWriteFile(getUsagePath(), `${JSON.stringify(emptyFile(), null, 2)}\n`);
   } catch {
     // Nothing persisted yet.
+  } finally {
+    lock?.release();
   }
 }

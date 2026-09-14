@@ -84,7 +84,13 @@ function providerHasModel(provider: GatewayProvider, model: string): boolean {
 }
 
 /** Split `provider/model` or `provider:model`; the model part may contain `/`. */
-function splitQualified(
+/**
+ * Split `provider/model` or `provider:model`. Exported so the CLI parses
+ * `--fallback` with exactly the same rules the router uses to resolve a
+ * requested model id — otherwise `provider:model` written as a fallback would be
+ * silently taken as a whole provider name.
+ */
+export function splitQualified(
   requested: string,
 ): { provider: string; model: string } | null {
   for (const separator of ["/", ":"]) {
@@ -96,7 +102,6 @@ function splitQualified(
   }
   return null;
 }
-
 function pushCandidate(
   out: RouteCandidate[],
   seen: Set<string>,

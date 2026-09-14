@@ -14,10 +14,13 @@
  *    lock contention.
  */
 
-import { existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteFile, ensureDir } from "../utils/fs.js";
+import {
+  acquireFileLock,
+  type FileLockHandle,
+} from "../utils/file-lock.js";
 import { getGatewayDir } from "../utils/paths.js";
 
 const WINDOW_MS = 60_000;
@@ -60,115 +63,22 @@ const UNLIMITED: RateLimitDecision = {
   retryAfterSeconds: 0,
 };
 
-function sleepSync(ms: number): void {
-  const shared = new Int32Array(new SharedArrayBuffer(4));
-  Atomics.wait(shared, 0, 0, ms);
-}
-
-function pidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid < 1) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-interface LockHandle {
-  release(): void;
-}
-
 /**
  * Acquire the counter lock, or return null when it stays busy past the timeout.
- * A lock whose owner process is gone and which is older than the stale age is
- * reclaimed.
+ * Shared implementation with the usage accounting file (see utils/file-lock).
  */
-function acquireLock(now: number): LockHandle | null {
-  const path = getRateLimitLockPath();
-  const id = randomBytes(8).toString("hex");
-  const payload = JSON.stringify({ id, pid: process.pid, at: now });
-  const deadline = now + LOCK_TIMEOUT_MS;
-  // The directory may not exist yet on a fresh install; without this the
-  // exclusive create below fails with ENOENT and persistence never engages.
-  try {
-    ensureDir(getGatewayDir());
-  } catch {
-    return null;
-  }
-
-  for (;;) {
-    try {
-      writeFileSync(path, payload, { encoding: "utf8", flag: "wx", mode: 0o600 });
-      return makeLock(path, id);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") return null;
-    }
-
-    if (reclaimable(path)) {
-      try {
-        const tmp = `${path}.${id}.tmp`;
-        writeFileSync(tmp, payload, { encoding: "utf8", mode: 0o600 });
-        renameSync(tmp, path);
-        if (readLockId(path) === id) return makeLock(path, id);
-      } catch {
-        // Someone else won the race; fall through and retry.
-      }
-    }
-
-    if (Date.now() >= deadline) return null;
-    sleepSync(LOCK_SPIN_MS);
-  }
-}
-
-function readLockId(path: string): string | null {
-  try {
-    const raw = JSON.parse(readFileSync(path, "utf8")) as { id?: unknown };
-    return typeof raw.id === "string" ? raw.id : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * A lock is reclaimable when its owner is gone. A dead owner can never release
- * the lock, so that case is reclaimed immediately; when ownership cannot be
- * determined we fall back to an age check that trusts whichever of the file
- * mtime or the recorded timestamp looks older.
- */
-function reclaimable(path: string): boolean {
-  let record: { pid?: unknown; at?: unknown } = {};
-  let readable = false;
-  try {
-    record = JSON.parse(readFileSync(path, "utf8")) as typeof record;
-    readable = true;
-  } catch {
-    // Unreadable lock file: fall back to the age check below.
-  }
-  if (readable && typeof record.pid === "number") {
-    return !pidAlive(record.pid);
-  }
-
-  let fileAge = Number.POSITIVE_INFINITY;
-  try {
-    fileAge = Date.now() - statSync(path).mtimeMs;
-  } catch {
-    return true;
-  }
-  const recordedAge =
-    typeof record.at === "number"
-      ? Date.now() - record.at
-      : Number.NEGATIVE_INFINITY;
-  return Math.max(fileAge, recordedAge) > LOCK_STALE_MS;
-}
-
-function makeLock(path: string, id: string): LockHandle {
-  return {
-    release() {
-      if (readLockId(path) === id) rmSync(path, { force: true });
+function acquireLock(now: number): FileLockHandle | null {
+  return acquireFileLock(
+    getRateLimitLockPath(),
+    {
+      timeoutMs: LOCK_TIMEOUT_MS,
+      staleMs: LOCK_STALE_MS,
+      spinMs: LOCK_SPIN_MS,
     },
-  };
+    now,
+  );
 }
+
 
 function readWindows(): WindowMap {
   const path = getRateLimitPath();

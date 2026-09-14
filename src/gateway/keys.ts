@@ -194,6 +194,16 @@ export interface CreatedGatewayKey {
   plaintext: string;
 }
 
+/**
+ * Display hint for a key. The id alone already identifies the key, so only the
+ * last 4 characters of the secret are shown — the previous form leaked both the
+ * first and last 4 characters into `key list`, `status --json` and the keys file,
+ * which sits badly with the "only the hash is stored" promise.
+ */
+function keyHint(id: string, secret: string): string {
+  return `${KEY_PREFIX}-${id}-…${secret.slice(-4)}`;
+}
+
 export function createGatewayKey(
   options: CreateGatewayKeyOptions = {},
 ): CreatedGatewayKey {
@@ -217,7 +227,7 @@ export function createGatewayKey(
     name: options.name?.trim() || `key-${id.slice(0, 4)}`,
     hash: hashSecret(secret, salt),
     salt,
-    hint: `${KEY_PREFIX}-${id}-${secret.slice(0, 4)}…${secret.slice(-4)}`,
+    hint: keyHint(id, secret),
     createdAt: new Date().toISOString(),
     expiresAt,
     revokedAt: null,
@@ -327,7 +337,7 @@ export function rotateGatewayKey(idOrName: string): CreatedGatewayKey {
     id,
     hash: hashSecret(secret, salt),
     salt,
-    hint: `${KEY_PREFIX}-${id}-${secret.slice(0, 4)}…${secret.slice(-4)}`,
+    hint: keyHint(id, secret),
     createdAt: new Date().toISOString(),
     lastUsedAt: null,
   };

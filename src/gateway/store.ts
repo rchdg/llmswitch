@@ -6,7 +6,13 @@
  * different names. The gateway needs one tool-independent provider list.
  */
 
-import { existsSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
+import {
+  existsSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
 import { chmodSync } from "node:fs";
 import { TOOLS, isApiFormat, normalizeProxyValue } from "../types.js";
 import type { Tool } from "../types.js";
@@ -137,9 +143,48 @@ function normalizeProvider(
   };
 }
 
+/**
+ * Provider list cache.
+ *
+ * The gateway data plane reads the provider list on every request (routing,
+ * /v1/models, key scoping), and each read scanned the directory and JSON-parsed
+ * every file. Invalidation is by directory mtime plus a short TTL, so an edit
+ * from another process is still picked up within a second.
+ */
+const PROVIDER_CACHE_TTL_MS = 1_000;
+let providerCache: {
+  at: number;
+  dir: string;
+  dirMtimeMs: number;
+  value: GatewayProvider[];
+} | null = null;
+
+/** Drop the cache after any write (same process). */
+export function invalidateGatewayProviderCache(): void {
+  providerCache = null;
+}
+
 export function listGatewayProviders(): GatewayProvider[] {
   const dir = getGatewayProvidersDir();
   if (!existsSync(dir)) return [];
+
+  let dirMtimeMs = 0;
+  try {
+    dirMtimeMs = statSync(dir).mtimeMs;
+  } catch {
+    dirMtimeMs = 0;
+  }
+  const now = Date.now();
+  if (
+    providerCache &&
+    // 目录路径也要比对：LLM_SWITCH_HOME 变了（测试、多配置目录）就必须重读。
+    providerCache.dir === dir &&
+    providerCache.dirMtimeMs === dirMtimeMs &&
+    now - providerCache.at < PROVIDER_CACHE_TTL_MS
+  ) {
+    return providerCache.value;
+  }
+
   const out: GatewayProvider[] = [];
   for (const file of readdirSync(dir)) {
     if (!file.endsWith(".json")) continue;
@@ -147,9 +192,11 @@ export function listGatewayProviders(): GatewayProvider[] {
     const provider = readGatewayProvider(name);
     if (provider) out.push(provider);
   }
-  return out.sort(
+  const sorted = out.sort(
     (a, b) => a.priority - b.priority || a.name.localeCompare(b.name),
   );
+  providerCache = { at: now, dir, dirMtimeMs, value: sorted };
+  return sorted;
 }
 
 export function readGatewayProvider(name: string): GatewayProvider | null {
@@ -210,6 +257,7 @@ export function saveGatewayProvider(provider: GatewayProvider): GatewayProvider 
     getGatewayProviderPath(next.name),
     JSON.stringify(next, null, 2) + "\n",
   );
+  invalidateGatewayProviderCache();
   return next;
 }
 
@@ -219,6 +267,7 @@ export function deleteGatewayProvider(name: string): void {
     throw new Error(`未找到 gateway provider「${name}」`);
   }
   unlinkSync(path);
+  invalidateGatewayProviderCache();
   // Drop routes that pointed at the removed provider.
   const routes = listGatewayRoutes().filter((route) => {
     if (route.provider === name) return false;

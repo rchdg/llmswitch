@@ -13,7 +13,10 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
-import { parseBridgeRuntimeLimits } from "../bridge/runtime.js";
+import {
+  ConcurrencyGate,
+  parseBridgeRuntimeLimits,
+} from "../bridge/runtime.js";
 import { randomBytes } from "node:crypto";
 import {
   requestWithNodeTransport,
@@ -396,23 +399,6 @@ function applyCors(
   );
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Max-Age", "600");
-}
-
-/** Bounded in-flight request counter shared by all data-plane endpoints. */
-class ConcurrencyGate {
-  private active = 0;
-  constructor(private readonly max: number) {}
-  get inFlight(): number {
-    return this.active;
-  }
-  tryAcquire(): boolean {
-    if (this.active >= this.max) return false;
-    this.active += 1;
-    return true;
-  }
-  release(): void {
-    if (this.active > 0) this.active -= 1;
-  }
 }
 
 export function createGatewayServer(
