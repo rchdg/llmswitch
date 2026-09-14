@@ -8,6 +8,7 @@ export interface BridgeRuntimeLimits {
   connectTimeoutMs: number;
   idleTimeoutMs: number;
   totalTimeoutMs: number;
+  /** Max in-flight data-plane requests; 0 means unlimited (the default). */
   maxConcurrency: number;
   rateLimitPerMinute: number;
 }
@@ -20,7 +21,9 @@ export const DEFAULT_BRIDGE_RUNTIME_LIMITS: Readonly<BridgeRuntimeLimits> =
     connectTimeoutMs: 30_000,
     idleTimeoutMs: 90_000,
     totalTimeoutMs: 600_000,
-    maxConcurrency: 16,
+    // 默认不限并发：这些进程只服务本机的 Claude Code / Codex / OpenCode 或
+    // 自己签发 Key 的客户端，真正的瓶颈在上游而不在这里。需要保护时显式设值。
+    maxConcurrency: 0,
     rateLimitPerMinute: 120,
   });
 
@@ -71,7 +74,8 @@ const RUNTIME_LIMIT_SPECS: readonly RuntimeLimitSpec[] = [
   {
     env: "LLM_SWITCH_MAX_CONCURRENCY",
     key: "maxConcurrency",
-    min: 1,
+    // 0 = 不限并发（默认）。
+    min: 0,
     max: 128,
   },
   {
@@ -109,6 +113,9 @@ export function parseBridgeRuntimeLimits(
  * Bounded in-flight request counter shared by the bridge and the gateway.
  * `LLM_SWITCH_MAX_CONCURRENCY` is documented as applying to both, so both must
  * actually enforce it.
+ *
+ * A max of 0 (the default) means unlimited: requests are still counted so
+ * `gateway status` can report live concurrency, but none are ever rejected.
  */
 export class ConcurrencyGate {
   private active = 0;
@@ -116,8 +123,15 @@ export class ConcurrencyGate {
   get inFlight(): number {
     return this.active;
   }
+  /** Whether a ceiling is configured at all. */
+  get limited(): boolean {
+    return this.max > 0;
+  }
+  get limit(): number {
+    return this.max;
+  }
   tryAcquire(): boolean {
-    if (this.active >= this.max) return false;
+    if (this.limited && this.active >= this.max) return false;
     this.active += 1;
     return true;
   }

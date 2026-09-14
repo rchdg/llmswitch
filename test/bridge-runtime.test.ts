@@ -15,6 +15,7 @@ import {
 describe("ConcurrencyGate", () => {
   test("refuses beyond the limit and recovers after release", () => {
     const gate = new ConcurrencyGate(2);
+    expect(gate.limited).toBe(true);
     expect(gate.tryAcquire()).toBe(true);
     expect(gate.tryAcquire()).toBe(true);
     expect(gate.inFlight).toBe(2);
@@ -29,6 +30,18 @@ describe("ConcurrencyGate", () => {
     gate.release();
     expect(gate.inFlight).toBe(0);
     expect(gate.tryAcquire()).toBe(true);
+  });
+
+  // 0 表示不限并发（默认值）：仍然计数以便 status 展示在途请求，但从不拒绝。
+  test("a max of 0 never rejects but still counts in-flight requests", () => {
+    const gate = new ConcurrencyGate(0);
+    expect(gate.limited).toBe(false);
+    for (let i = 0; i < 500; i++) {
+      expect(gate.tryAcquire()).toBe(true);
+    }
+    expect(gate.inFlight).toBe(500);
+    gate.release();
+    expect(gate.inFlight).toBe(499);
   });
 });
 
@@ -144,5 +157,22 @@ describe("bridge runtime parsing", () => {
     expect(() =>
       parseBridgeRuntimeLimits({ LLM_SWITCH_MAX_CONCURRENCY: "129" }),
     ).toThrow(/LLM_SWITCH_MAX_CONCURRENCY/);
+    expect(() =>
+      parseBridgeRuntimeLimits({ LLM_SWITCH_MAX_CONCURRENCY: "-1" }),
+    ).toThrow(/LLM_SWITCH_MAX_CONCURRENCY/);
+  });
+
+  test("concurrency defaults to unlimited and accepts an explicit 0", () => {
+    expect(DEFAULT_BRIDGE_RUNTIME_LIMITS.maxConcurrency).toBe(0);
+    expect(parseBridgeRuntimeLimits({}).maxConcurrency).toBe(0);
+    // 0 是合法取值（显式声明不限），不应被当作越界
+    expect(
+      parseBridgeRuntimeLimits({ LLM_SWITCH_MAX_CONCURRENCY: "0" })
+        .maxConcurrency,
+    ).toBe(0);
+    expect(
+      parseBridgeRuntimeLimits({ LLM_SWITCH_MAX_CONCURRENCY: "1" })
+        .maxConcurrency,
+    ).toBe(1);
   });
 });

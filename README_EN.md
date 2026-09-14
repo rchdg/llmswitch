@@ -415,7 +415,7 @@ environment variables shared with the Bridge:
 
 | Environment variable | Default | Description |
 | --- | --- | --- |
-| `LLM_SWITCH_MAX_CONCURRENCY` | 16 | Max concurrent requests |
+| `LLM_SWITCH_MAX_CONCURRENCY` | 0 (unlimited) | Max concurrent requests, 503 beyond it; 0 means unlimited |
 | `LLM_SWITCH_MAX_BODY_BYTES` | 16MB | Request body cap |
 | `LLM_SWITCH_MAX_RESPONSE_BYTES` | 32MB | Upstream response cap |
 | `LLM_SWITCH_CONNECT_TIMEOUT_MS` | 30000 | Upstream connect timeout |

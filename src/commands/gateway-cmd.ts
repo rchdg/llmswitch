@@ -454,7 +454,8 @@ function registerServerCommands(gateway: Command): void {
       if (data.alive && probe.stats) {
         const stats = probe.stats;
         console.log(
-          `请求：共 ${stats.requests} 次（4xx ${stats.errors4xx}，5xx ${stats.errors5xx}），并发 ${stats.activeConnections}/${stats.maxConcurrency}`,
+          `请求：共 ${stats.requests} 次（4xx ${stats.errors4xx}，5xx ${stats.errors5xx}），` +
+            `并发 ${stats.activeConnections}${stats.maxConcurrency > 0 ? `/${stats.maxConcurrency}` : "（不限）"}`,
         );
       }
       console.log(`监听：${data.listener.bindHost}:${data.listener.port}${data.listener.allowRemote ? "（已对外暴露）" : "（仅本机）"}`);
@@ -1195,7 +1196,11 @@ function registerConfigCommands(gateway: Command): void {
       console.log("运行时限额（环境变量可调，与 bridge 共用）：");
       for (const line of renderTable(
         [
-          { k: "最大并发", v: String(limits.maxConcurrency), env: "LLM_SWITCH_MAX_CONCURRENCY" },
+          {
+            k: "最大并发",
+            v: limits.maxConcurrency > 0 ? String(limits.maxConcurrency) : "不限",
+            env: "LLM_SWITCH_MAX_CONCURRENCY",
+          },
           { k: "请求体上限", v: `${limits.maxBodyBytes} B`, env: "LLM_SWITCH_MAX_BODY_BYTES" },
           { k: "上游响应上限", v: `${limits.maxResponseBytes} B`, env: "LLM_SWITCH_MAX_RESPONSE_BYTES" },
           { k: "连接超时", v: `${limits.connectTimeoutMs} ms`, env: "LLM_SWITCH_CONNECT_TIMEOUT_MS" },

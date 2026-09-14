@@ -722,7 +722,8 @@ async function pipeRawStream(
 
 export function createBridgeServer(options: BridgeServerOptions = {}): Server {
   const limits = parseBridgeRuntimeLimits();
-  // LLM_SWITCH_MAX_CONCURRENCY 文档上说与 gateway 共用，之前 bridge 侧只解析不执行。
+  // LLM_SWITCH_MAX_CONCURRENCY 与 gateway 共用；默认 0 表示不限，
+  // 此时 gate 只统计在途请求、不做拒绝。
   const gate = new ConcurrencyGate(limits.maxConcurrency);
 
   return createServer(async (req, res) => {

@@ -372,7 +372,7 @@ llms gateway logs --follow     # 持续跟踪
 
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `LLM_SWITCH_MAX_CONCURRENCY` | 16 | 最大并发请求数 |
+| `LLM_SWITCH_MAX_CONCURRENCY` | 0（不限） | 最大并发请求数，超出返回 503；0 表示不限 |
 | `LLM_SWITCH_MAX_BODY_BYTES` | 16MB | 请求体上限 |
 | `LLM_SWITCH_MAX_RESPONSE_BYTES` | 32MB | 上游响应上限 |
 | `LLM_SWITCH_CONNECT_TIMEOUT_MS` | 30000 | 上游连接超时 |
