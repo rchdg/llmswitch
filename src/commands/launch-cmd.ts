@@ -34,6 +34,10 @@ export function registerLaunchCommand(program: Command): void {
       "指定 profile（默认：包含该模型的 profile / 当前启用）",
     )
     .option("--print-only", "只写入配置，不启动 CLI")
+    .option(
+      "--save",
+      "把本次模型存为该供应商的默认模型（默认不改动已保存的配置）",
+    )
     .option("--dry-run", "只打印计划，不写配置、不启动")
     .option("--json", "JSON 输出")
     .action(
@@ -46,6 +50,7 @@ export function registerLaunchCommand(program: Command): void {
           printOnly?: boolean;
           dryRun?: boolean;
           json?: boolean;
+          save?: boolean;
         },
       ) => {
         if (!isTool(toolArg)) {
@@ -91,6 +96,7 @@ export function registerLaunchCommand(program: Command): void {
             binary: resolveBinary(toolArg),
             args: passthrough,
             dryRun: true,
+            saved: false,
           };
           if (opts.json) {
             console.log(JSON.stringify(plan, null, 2));
@@ -111,6 +117,7 @@ export function registerLaunchCommand(program: Command): void {
           profile: opts.profile,
           args: passthrough,
           printOnly: opts.printOnly,
+          save: opts.save,
         });
 
         if (opts.json) {
@@ -124,6 +131,7 @@ export function registerLaunchCommand(program: Command): void {
                 args: plan.args,
                 configPath: plan.configPath,
                 applied: plan.applied,
+                saved: plan.saved,
                 printOnly: Boolean(opts.printOnly),
               },
               null,

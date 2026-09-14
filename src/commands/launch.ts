@@ -33,6 +33,13 @@ export interface LaunchOptions {
   args?: string[];
   printOnly?: boolean;
   dryRun?: boolean;
+  /**
+   * Persist the resolved model as the profile's new default.
+   * Off by default: `llms launch codex some-model` is a one-shot run and must
+   * not silently rewrite stored config (a typo would become the new default
+   * and pollute the saved model list forever).
+   */
+  save?: boolean;
 }
 
 export interface LaunchPlan {
@@ -42,6 +49,8 @@ export interface LaunchPlan {
   binary: string;
   args: string[];
   applied: boolean;
+  /** Whether the profile itself was updated on disk. */
+  saved: boolean;
   configPath?: string;
   restartHint: string;
 }
@@ -62,30 +71,58 @@ export async function launchTool(options: LaunchOptions): Promise<LaunchPlan> {
     profile: options.profile,
   });
 
-  if (profile.models.default !== model) {
-    if (!profile.models.list.includes(model)) {
-      profile.models.list.push(model);
-    }
-    profile.models.default = model;
-    saveProfile(tool, profile);
-    profile = requireProfile(tool, profile.name);
-  } else if (!profile.models.list.includes(model)) {
-    profile.models.list.push(model);
-    saveProfile(tool, profile);
-    profile = requireProfile(tool, profile.name);
+  // 模型名打错时上游只会返回一个含糊的 404，这里先把疑点点出来。
+  if (!profile.models.list.includes(model)) {
+    console.error(
+      `注意：模型「${model}」不在 ${tool}/${profile.name} 的模型列表中，仍按原样发给上游。` +
+        `确认可用后可加 --save 存为该供应商的默认模型。`,
+    );
   }
 
-  const result = await applyProfile(tool, profile);
+  // 只有显式 --save 才把本次模型写回 profile；否则仅影响本次写入工具配置。
+  let saved = false;
+  if (options.save && profile.models.default !== model) {    const next: Profile = {
+      ...profile,
+      models: {
+        ...profile.models,
+        default: model,
+        list: profile.models.list.includes(model)
+          ? profile.models.list
+          : [...profile.models.list, model],
+      },
+    };
+    saveProfile(tool, next);
+    profile = requireProfile(tool, next.name);
+    saved = true;
+  }
+
+  // 传给 adapter 的是一份内存副本：本次用哪个模型就写哪个，但不落盘。
+  const effective: Profile =
+    profile.models.default === model
+      ? profile
+      : {
+          ...profile,
+          models: {
+            ...profile.models,
+            default: model,
+            list: profile.models.list.includes(model)
+              ? profile.models.list
+              : [...profile.models.list, model],
+          },
+        };
+
+  const result = await applyProfile(tool, effective);
   const binary = resolveBinary(tool);
   const args = options.args ?? [];
 
   const plan: LaunchPlan = {
     tool,
-    profile,
+    profile: effective,
     model,
     binary,
     args,
     applied: true,
+    saved,
     configPath: result.configPath,
     restartHint: result.restartHint,
   };

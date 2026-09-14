@@ -1,11 +1,26 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   collectModelMeta,
   fetchModelMetadata,
+  getModelMetadataCachePath,
   lookupModelMeta,
   normalizeModelKey,
   parseModelMetadata,
 } from "../src/utils/model-metadata.ts";
+
+// 元数据抓取会写本地缓存；测试必须指向临时目录，否则会污染真实 ~/.config/llm-switch。
+let metaRoot: string;
+beforeEach(() => {
+  metaRoot = mkdtempSync(join(tmpdir(), "llms-meta-"));
+  process.env.LLM_SWITCH_HOME = join(metaRoot, "home");
+});
+afterEach(() => {
+  rmSync(metaRoot, { recursive: true, force: true });
+  delete process.env.LLM_SWITCH_HOME;
+});
 
 const SAMPLE_PAYLOAD = {
   data: [
@@ -203,13 +218,26 @@ describe("fetchModelMetadata pagination", () => {
     if (!address || typeof address === "string") throw new Error("missing port");
 
     try {
-      const catalog = await fetchModelMetadata({
-        endpoint: `http://127.0.0.1:${address.port}/api/v1/models`,
-      });
+      const endpoint = `http://127.0.0.1:${address.port}/api/v1/models`;
+      // force：这条用例就是要验证翻页，不能被本地缓存短路
+      const catalog = await fetchModelMetadata({ endpoint, force: true });
       expect(Object.keys(catalog.full)).toHaveLength(25);
       expect(lookupModelMeta(catalog, "model-24")?.name).toBe("Model 24");
       expect(lookupModelMeta(catalog, "model-0")?.attachment).toBe(true);
       expect(lookupModelMeta(catalog, "model-1")?.attachment).toBe(false);
+
+      // 抓取成功后应写下缓存，并且第二次调用能命中（不再请求上游）
+      expect(existsSync(getModelMetadataCachePath())).toBe(true);
+      let requestsAfter = 0;
+      const countingServer = createServer((_req, res) => {
+        requestsAfter += 1;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ data: [], meta: { total: 0 } }));
+      });
+      const cached = await fetchModelMetadata({ endpoint });
+      expect(Object.keys(cached.full)).toHaveLength(25);
+      expect(requestsAfter).toBe(0);
+      countingServer.close();
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }

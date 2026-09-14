@@ -5,11 +5,13 @@ import { join } from "node:path";
 import type { Profile } from "../src/types.ts";
 import {
   resolveProfile,
+  requireProfile,
   saveProfile,
   setActiveProfile,
 } from "../src/store/profiles.ts";
 import {
   findProfileForModel,
+  launchTool,
   matchModel,
   normalizeModelId,
   resolveLaunchTarget,
@@ -80,6 +82,63 @@ describe("resolveLaunchTarget", () => {
       profile("b", ["glm-5.2"]),
     ];
     expect(findProfileForModel(list, "glm5.2")?.name).toBe("b");
+  });
+});
+
+describe("launch does not mutate stored profiles", () => {
+  // Regression: launchTool used to write models.default/list back on every run,
+  // so `llms launch codex <typo>` permanently polluted the saved profile.
+  test("one-shot model is applied without persisting", async () => {
+    process.env.CODEX_HOME = join(root, "codex-home");
+    saveProfile("codex", profile("custom", ["glm-5.2"]));
+    setActiveProfile("codex", "custom");
+
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => errors.push(args.map(String).join(" "));
+    try {
+      const plan = await launchTool({
+        tool: "codex",
+        model: "typo-model",
+        printOnly: true,
+      });
+      expect(plan.model).toBe("typo-model");
+      expect(plan.saved).toBe(false);
+    } finally {
+      console.error = originalError;
+      delete process.env.CODEX_HOME;
+    }
+
+    const stored = requireProfile("codex", "custom");
+    expect(stored.models.default).toBe("glm-5.2");
+    expect(stored.models.list).toEqual(["glm-5.2"]);
+    // 未知模型要给出提示，避免上游返回含糊的 404
+    expect(errors.join("\n")).toMatch(/typo-model/);
+  });
+
+  test("--save persists the model as the new default", async () => {
+    process.env.CODEX_HOME = join(root, "codex-home2");
+    saveProfile("codex", profile("custom", ["glm-5.2"]));
+    setActiveProfile("codex", "custom");
+
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+      const plan = await launchTool({
+        tool: "codex",
+        model: "glm-5.3",
+        printOnly: true,
+        save: true,
+      });
+      expect(plan.saved).toBe(true);
+    } finally {
+      console.error = originalError;
+      delete process.env.CODEX_HOME;
+    }
+
+    const stored = requireProfile("codex", "custom");
+    expect(stored.models.default).toBe("glm-5.3");
+    expect(stored.models.list).toContain("glm-5.3");
   });
 });
 

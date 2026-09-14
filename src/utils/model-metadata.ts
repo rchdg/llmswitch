@@ -1,9 +1,17 @@
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ProxyConfig } from "../types.js";
 import { requestWithNodeTransport } from "../bridge/transport.js";
+import { atomicWriteFile } from "./fs.js";
+import { getAppConfigRoot } from "./paths.js";
 
 export const MODEL_METADATA_SOURCE = "https://models.lonae.com";
 const DEFAULT_ENDPOINT = `${MODEL_METADATA_SOURCE}/api/v1/models`;
 const PAGE_SIZE = 1000;
+/** Hard cap on pagination; see fetchModelMetadata. */
+const MAX_PAGES = 50;
+/** Metadata changes slowly, so a day-old cache is fine and saves a round trip. */
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 export interface ModelModalities {
   input: string[];
@@ -222,16 +230,30 @@ export function collectModelMeta(
  * Paginates automatically (page_size capped at 1000 per request).
  */
 export async function fetchModelMetadata(
-  options: { proxy?: ProxyConfig; timeoutMs?: number; endpoint?: string } = {},
+  options: {
+    proxy?: ProxyConfig;
+    timeoutMs?: number;
+    endpoint?: string;
+    /** Ignore the on-disk cache and always hit the network. */
+    force?: boolean;
+  } = {},
 ): Promise<ModelMetadataCatalog> {
   const endpoint = options.endpoint || DEFAULT_ENDPOINT;
   const timeoutMs = options.timeoutMs ?? 15_000;
+
+  // 每次选模型都联网拉全量元数据太重，先看本地缓存。
+  if (!options.force) {
+    const cached = readMetadataCache(endpoint);
+    if (cached) return parseModelMetadata({ data: cached });
+  }
 
   const rows: unknown[] = [];
   let total = Infinity;
   let page = 1;
 
-  while (rows.length < total) {
+  // 页数上限：meta.total 若谎报偏大、而上游又持续返回非空页，
+  // 没有这个上限就会一直翻页下去。
+  while (rows.length < total && page <= MAX_PAGES) {
     const url = `${endpoint}${endpoint.includes("?") ? "&" : "?"}page_size=${PAGE_SIZE}&page=${page}`;
     const payload = await requestJson(url, options.proxy, timeoutMs);
     const batch = payload && typeof payload === "object"
@@ -247,7 +269,50 @@ export async function fetchModelMetadata(
     page += 1;
   }
 
+  if (rows.length > 0) writeMetadataCache(endpoint, rows);
   return parseModelMetadata({ data: rows });
+}
+
+export function getModelMetadataCachePath(): string {
+  return join(getAppConfigRoot(), "model-metadata-cache.json");
+}
+
+interface MetadataCacheFile {
+  version: 1;
+  endpoint: string;
+  fetchedAt: number;
+  rows: unknown[];
+}
+
+function readMetadataCache(endpoint: string): unknown[] | null {
+  const path = getModelMetadataCachePath();
+  if (!existsSync(path)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(path, "utf8")) as MetadataCacheFile;
+    if (raw?.version !== 1 || raw.endpoint !== endpoint) return null;
+    if (!Array.isArray(raw.rows) || raw.rows.length === 0) return null;
+    if (Date.now() - raw.fetchedAt > CACHE_TTL_MS) return null;
+    return raw.rows;
+  } catch {
+    return null;
+  }
+}
+
+function writeMetadataCache(endpoint: string, rows: unknown[]): void {
+  try {
+    const payload: MetadataCacheFile = {
+      version: 1,
+      endpoint,
+      fetchedAt: Date.now(),
+      rows,
+    };
+    atomicWriteFile(
+      getModelMetadataCachePath(),
+      JSON.stringify(payload) + "\n",
+    );
+  } catch {
+    // 缓存失败不影响本次结果。
+  }
 }
 
 async function requestJson(
