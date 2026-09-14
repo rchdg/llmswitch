@@ -301,9 +301,9 @@ export function importProvidersFromProfiles(
         new Set(
           [
             profile.models.default,
-            profile.models.fast,
+            profile.models.smallModel,
             ...(profile.models.list || []),
-          ].filter((m): m is string => Boolean(m && m.trim())),
+          ].filter((m): m is string => Boolean(m?.trim())),
         ),
       );
       const provider = saveGatewayProvider({

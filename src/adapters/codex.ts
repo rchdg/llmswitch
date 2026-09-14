@@ -1,10 +1,17 @@
 import { existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { parse, stringify } from "smol-toml";
 import type { ApplyResult, Profile } from "../types.js";
 import { emptyProxy } from "../types.js";
 import { assertCompatible } from "../formats/compatibility.js";
 import { normalizeBaseUrlForFormat } from "../utils/base-url.js";
-import { atomicWriteFile, backupFile, ensureDir } from "../utils/fs.js";
+import {
+  backupFile,
+  ensureDir,
+  plainObjectAt,
+  readStructuredFile,
+  writeFilesAtomically,
+} from "../utils/fs.js";
 import { buildProxyEnv } from "../utils/proxy.js";
 import {
   getBackupsDir,
@@ -21,13 +28,42 @@ import {
 
 type TomlTable = Record<string, unknown>;
 
+/**
+ * Codex identifiers derived from a profile name.
+ *
+ * Profile names may contain `-` (see NAME_RE) but Codex provider keys and env
+ * var names are safest restricted to `[A-Za-z0-9_]`. Naively replacing `-` with
+ * `_` is not injective: `a-b` and `a_b` both collapse to `a_b`, so one profile
+ * would silently overwrite the other's provider block and API key. Append a
+ * short hash of the original name whenever the name contains a character that
+ * gets rewritten, which keeps distinct profiles distinct.
+ */
+function sanitizeCodexId(name: string): string {
+  const sanitized = name.replace(/[^a-zA-Z0-9_]/g, "_");
+  if (sanitized === name) return sanitized;
+  const suffix = createHash("sha256")
+    .update(name)
+    .digest("hex")
+    .slice(0, 6);
+  return `${sanitized}_${suffix}`;
+}
+
 function providerKey(name: string): string {
+  return sanitizeCodexId(name);
+}
+
+/** Pre-fix form, kept only so stale entries can be cleaned up on apply. */
+function legacyProviderKey(name: string): string {
   return name.replace(/[^a-zA-Z0-9_]/g, "_");
 }
 
 export function envKeyName(profileName: string): string {
-  const key = providerKey(profileName).toUpperCase();
-  return `LLM_SWITCH_${key}_API_KEY`;
+  return `LLM_SWITCH_${providerKey(profileName).toUpperCase()}_API_KEY`;
+}
+
+/** Pre-fix env var name; removed alongside the current one so no key lingers. */
+export function legacyEnvKeyName(profileName: string): string {
+  return `LLM_SWITCH_${legacyProviderKey(profileName).toUpperCase()}_API_KEY`;
 }
 
 /**
@@ -45,8 +81,10 @@ function applyModelInfo(config: TomlTable, profile: Profile): void {
 }
 
 export function readCodexConfig(path = getCodexConfigPath()): TomlTable {
-  if (!existsSync(path)) return {};
-  return parse(readFileSync(path, "utf8")) as TomlTable;
+  return readStructuredFile(path, (text) => parse(text) as TomlTable, {
+    label: "Codex 配置",
+    fallback: () => ({}),
+  });
 }
 
 export function buildCodexConfig(
@@ -57,12 +95,15 @@ export function buildCodexConfig(
   assertCompatible("codex", profile.apiFormat);
   const id = providerKey(profile.name);
   const providers = {
-    ...((existing.model_providers as TomlTable) || {}),
+    ...plainObjectAt(existing, "model_providers"),
   };
 
   const providerBlock: TomlTable = {
     name: profile.displayName || profile.name,
     base_url: effectiveBaseUrl,
+    // 对 Codex 一律声明 responses：原生 openai-responses 上游直连，
+    // openai-chat 上游则由本地 bridge 转成 /v1/responses 后再交给 Codex，
+    // 两种情况下 Codex 看到的都是 Responses 协议。
     wire_api: "responses",
     env_key: envKeyName(profile.name),
     requires_openai_auth: false,
@@ -77,6 +118,9 @@ export function buildCodexConfig(
   }
 
   providers[id] = providerBlock;
+  // 清掉旧命名方案留下的同名 provider 块（否则会与新键并存）。
+  const legacyId = legacyProviderKey(profile.name);
+  if (legacyId !== id) delete providers[legacyId];
 
   const next: TomlTable = {
     ...existing,
@@ -114,7 +158,10 @@ export function buildCodexEnvFile(
     map.set(k, v);
   }
 
+  // 旧命名方案下的密钥行必须删掉，否则明文会一直留在 .env 里。
+  const legacyKeyName = legacyEnvKeyName(profile.name);
   const keyName = envKeyName(profile.name);
+  if (legacyKeyName !== keyName) map.delete(legacyKeyName);
   if (!map.has(keyName)) order.push(keyName);
   // When bridging, Codex talks to local bridge; key can be placeholder.
   // Bridge uses upstream.apiKey from its own config. Still write real key
@@ -197,14 +244,13 @@ export async function applyCodexProfile(
   );
   backupFile(envPath, getBackupsDir("codex"), "env");
 
+  // config.toml 与 .env 必须一起生效：先把两份内容都构造好，再作为一个单元写入。
   const next = buildCodexConfig(existing, profile, effectiveBaseUrl);
-  atomicWriteFile(configPath, stringify(next) + "\n");
-
   const prevEnv = existsSync(envPath) ? readFileSync(envPath, "utf8") : "";
-  atomicWriteFile(
-    envPath,
-    buildCodexEnvFile(prevEnv, profile, effectiveApiKey),
-  );
+  writeFilesAtomically([
+    { path: configPath, content: stringify(next) + "\n" },
+    { path: envPath, content: buildCodexEnvFile(prevEnv, profile, effectiveApiKey) },
+  ]);
 
   setActiveProfile("codex", profile.name);
 
@@ -235,12 +281,14 @@ export async function deactivateCodexProfile(
 
   const next: TomlTable = { ...existing };
   const providers = {
-    ...((existing.model_providers as TomlTable) || {}),
+    ...plainObjectAt(existing, "model_providers"),
   };
   if (profileName) {
     const id = providerKey(profileName);
     delete providers[id];
-    if (next.model_provider === id) {
+    const legacyId = legacyProviderKey(profileName);
+    if (legacyId !== id) delete providers[legacyId];
+    if (next.model_provider === id || next.model_provider === legacyId) {
       delete next.model_provider;
       delete next.model;
       delete next.model_context_window;
@@ -251,10 +299,11 @@ export async function deactivateCodexProfile(
     delete next.model_context_window;
   }
   next.model_providers = providers;
-  atomicWriteFile(configPath, stringify(next) + "\n");
-
   const prevEnv = existsSync(envPath) ? readFileSync(envPath, "utf8") : "";
-  atomicWriteFile(envPath, stripCodexManagedEnv(prevEnv, profileName));
+  writeFilesAtomically([
+    { path: configPath, content: stringify(next) + "\n" },
+    { path: envPath, content: stripCodexManagedEnv(prevEnv, profileName) },
+  ]);
 
   await clearBridgeUpstream("codex");
 
@@ -281,7 +330,11 @@ function stripCodexManagedEnv(
     "https_proxy",
     "all_proxy",
   ]);
-  const keyToRemove = profileName ? envKeyName(profileName) : null;
+  const keysToRemove = new Set(
+    profileName
+      ? [envKeyName(profileName), legacyEnvKeyName(profileName)]
+      : [],
+  );
   const out: string[] = [];
   for (const line of lines) {
     const trimmed = line.trim();
@@ -298,8 +351,12 @@ function stripCodexManagedEnv(
     }
     const k = trimmed.slice(0, eq).trim();
     if (proxyKeys.has(k)) continue;
-    if (keyToRemove && k === keyToRemove) continue;
-    if (!keyToRemove && k.startsWith("LLM_SWITCH_") && k.endsWith("_API_KEY")) {
+    if (keysToRemove.size > 0 && keysToRemove.has(k)) continue;
+    if (
+      keysToRemove.size === 0 &&
+      k.startsWith("LLM_SWITCH_") &&
+      k.endsWith("_API_KEY")
+    ) {
       continue;
     }
     out.push(line);

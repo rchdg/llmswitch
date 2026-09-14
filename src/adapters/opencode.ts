@@ -1,9 +1,15 @@
-import { existsSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type { ApiFormat, ApplyResult, ModelMeta, Profile } from "../types.js";
 import { assertCompatible } from "../formats/compatibility.js";
 import { normalizeBaseUrlForFormat } from "../utils/base-url.js";
-import { atomicWriteFile, backupFile, ensureDir } from "../utils/fs.js";
+import {
+  backupFile,
+  ensureDir,
+  plainObjectAt,
+  readStructuredFile,
+  stringRecordAt,
+  writeFilesAtomically,
+} from "../utils/fs.js";
 import { applyProxyToEnvRecord, clearProxyEnvKeys } from "../utils/proxy.js";
 import {
   getBackupsDir,
@@ -37,15 +43,17 @@ function npmForFormat(format: ApiFormat): string {
 export function readOpenCodeConfig(
   path = getOpenCodeConfigPath(),
 ): JsonObject {
-  if (!existsSync(path)) {
-    return { $schema: "https://opencode.ai/config.json" };
-  }
-  return JSON.parse(readFileSync(path, "utf8")) as JsonObject;
+  return readStructuredFile(path, (text) => JSON.parse(text) as JsonObject, {
+    label: "OpenCode 配置",
+    fallback: () => ({ $schema: "https://opencode.ai/config.json" }),
+  });
 }
 
 export function readOpenCodeAuth(path = getOpenCodeAuthPath()): JsonObject {
-  if (!existsSync(path)) return {};
-  return JSON.parse(readFileSync(path, "utf8")) as JsonObject;
+  return readStructuredFile(path, (text) => JSON.parse(text) as JsonObject, {
+    label: "OpenCode 凭据文件",
+    fallback: () => ({}),
+  });
 }
 
 /**
@@ -105,6 +113,12 @@ export function buildOpenCodeProviderBlock(
       metaById[profile.models.default],
     );
   }
+  if (profile.models.smallModel && !models[profile.models.smallModel]) {
+    models[profile.models.smallModel] = buildOpenCodeModelEntry(
+      profile.models.smallModel,
+      metaById[profile.models.smallModel],
+    );
+  }
 
   const options: JsonObject = {
     baseURL:
@@ -134,17 +148,13 @@ export function buildOpenCodeConfig(
 ): JsonObject {
   assertCompatible("opencode", profile.apiFormat);
   const id = providerId(profile.name);
-  const providers = {
-    ...((existing.provider as JsonObject) || {}),
-  };
+  const providers: JsonObject = { ...plainObjectAt(existing, "provider") };
   providers[id] = buildOpenCodeProviderBlock(profile, overrides);
 
   // Optional top-level env for proxy (OpenCode may pass through). When the
   // profile routes through the bridge, the upstream proxy is applied inside the
   // bridge; skip env-var proxy injection so OpenCode doesn't apply its own.
-  const env = {
-    ...((existing.env as Record<string, string>) || {}),
-  };
+  const env = stringRecordAt(existing, "env");
   clearProxyEnvKeys(env);
   if (!overrides) {
     applyProxyToEnvRecord(env, profile.proxy);
@@ -158,6 +168,15 @@ export function buildOpenCodeConfig(
     model: `${id}/${profile.models.default}`,
   };
 
+  // `small_model` handles lightweight tasks (title generation, summaries).
+  // Only touch it when it is ours: a user-configured value pointing at another
+  // provider must survive.
+  if (profile.models.smallModel) {
+    next.small_model = `${id}/${profile.models.smallModel}`;
+  } else if (ownsModelRef(existing.small_model, id)) {
+    delete next.small_model;
+  }
+
   if (Object.keys(env).length > 0) {
     next.env = env;
   } else {
@@ -165,6 +184,11 @@ export function buildOpenCodeConfig(
   }
 
   return next;
+}
+
+/** Whether an OpenCode `provider/model` reference belongs to the given provider id. */
+function ownsModelRef(value: unknown, id: string): boolean {
+  return typeof value === "string" && value.startsWith(`${id}/`);
 }
 
 export function buildOpenCodeAuth(
@@ -210,14 +234,16 @@ export async function applyOpenCodeProfile(profile: Profile): Promise<ApplyResul
       : undefined,
   );
 
-  atomicWriteFile(configPath, JSON.stringify(nextConfig, null, 2) + "\n");
-
+  // opencode.json 与 auth.json 必须一起生效，否则会出现“选了供应商但没有凭据”的半更新状态。
   const bridgeApiKey = bridgeConnection?.clientToken || profile.apiKey;
   const nextAuth = buildOpenCodeAuth(
     readOpenCodeAuth(authPath),
     { ...profile, apiKey: bridgeApiKey },
   );
-  atomicWriteFile(authPath, JSON.stringify(nextAuth, null, 2) + "\n");
+  writeFilesAtomically([
+    { path: configPath, content: JSON.stringify(nextConfig, null, 2) + "\n" },
+    { path: authPath, content: JSON.stringify(nextAuth, null, 2) + "\n" },
+  ]);
 
   setActiveProfile("opencode", profile.name);
 
@@ -248,15 +274,11 @@ export function deactivateOpenCodeProfile(
   );
   backupFile(authPath, getBackupsDir("opencode"), "auth");
 
-  const providers = {
-    ...((existing.provider as JsonObject) || {}),
-  };
+  const providers: JsonObject = { ...plainObjectAt(existing, "provider") };
   const id = profileName ? providerId(profileName) : null;
   if (id) delete providers[id];
 
-  const env = {
-    ...((existing.env as Record<string, string>) || {}),
-  };
+  const env = stringRecordAt(existing, "env");
   clearProxyEnvKeys(env);
 
   const next: JsonObject = {
@@ -266,19 +288,27 @@ export function deactivateOpenCodeProfile(
   if (id && typeof existing.model === "string" && existing.model.startsWith(`${id}/`)) {
     delete next.model;
   }
+  if (id && ownsModelRef(existing.small_model, id)) {
+    delete next.small_model;
+  }
   if (Object.keys(env).length > 0) next.env = env;
   else delete next.env;
 
-  atomicWriteFile(configPath, JSON.stringify(next, null, 2) + "\n");
-
+  const writes = [
+    { path: configPath, content: JSON.stringify(next, null, 2) + "\n" },
+  ];
   if (id) {
     const auth = readOpenCodeAuth(authPath);
     if (auth[id]) {
       const nextAuth = { ...auth };
       delete nextAuth[id];
-      atomicWriteFile(authPath, JSON.stringify(nextAuth, null, 2) + "\n");
+      writes.push({
+        path: authPath,
+        content: JSON.stringify(nextAuth, null, 2) + "\n",
+      });
     }
   }
+  writeFilesAtomically(writes);
 
   return {
     tool: "opencode",

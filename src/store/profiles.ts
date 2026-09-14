@@ -1,9 +1,14 @@
 import { existsSync, readdirSync, unlinkSync } from "node:fs";
 import { readFileSync } from "node:fs";
 import type { ModelMeta, Profile, Tool, ToolState } from "../types.js";
-import { isApiFormat, normalizeProxyValue } from "../types.js";
+import { API_FORMATS, isApiFormat, normalizeProxyValue } from "../types.js";
 import { normalizeBaseUrlForFormat } from "../utils/base-url.js";
-import { atomicWriteFile, ensureDir, maskSecret } from "../utils/fs.js";
+import {
+  atomicWriteFile,
+  ensureDir,
+  maskSecret,
+  readStructuredFile,
+} from "../utils/fs.js";
 import {
   getProfilePath,
   getProfilesDir,
@@ -72,7 +77,17 @@ export function listProfiles(tool: Tool): Profile[] {
   if (!existsSync(dir)) return [];
   return readdirSync(dir)
     .filter((f) => f.endsWith(".json"))
-    .map((f) => readProfile(tool, f.replace(/\.json$/, "")))
+    .map((f) => {
+      const name = f.replace(/\.json$/, "");
+      try {
+        return readProfile(tool, name);
+      } catch (err) {
+        // 单个坏 profile 不应让整份列表（以及所有命令）不可用。
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`警告：跳过损坏的 ${tool} profile「${name}」：${msg}`);
+        return null;
+      }
+    })
     .filter((p): p is Profile => p !== null)
     .sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -84,7 +99,12 @@ export function profileExists(tool: Tool, name: string): boolean {
 export function readProfile(tool: Tool, name: string): Profile | null {
   const path = getProfilePath(tool, name);
   if (!existsSync(path)) return null;
-  const raw = JSON.parse(readFileSync(path, "utf8")) as Profile;
+  const raw = readStructuredFile<Profile | null>(
+    path,
+    (text) => JSON.parse(text) as Profile,
+    { label: `${tool} 供应商配置`, fallback: () => null },
+  );
+  if (!raw) return null;
   return normalizeProfile(raw, name);
 }
 
@@ -113,6 +133,9 @@ export function resolveProfile(tool: Tool, query: string): Profile | null {
 
   const profiles = listProfiles(tool);
   const normalized = normalizeReference(trimmed);
+  // 纯分隔符的输入（如 "---"）归一化后为空串，而 "".includes("") 恒真，
+  // 会让下面的包含匹配命中任意 profile。这种查询直接视为无匹配。
+  if (!normalized) return null;
 
   const exactDisplay = profiles.find(
     (p) => normalizeReference(p.displayName) === normalized,
@@ -157,20 +180,28 @@ export function saveProfile(tool: Tool, profile: Profile): void {
   }
   const list = Array.from(
     new Set(
-      [profile.models.default, profile.models.fast, ...(profile.models.list || [])]
+      [
+        profile.models.default,
+        profile.models.smallModel,
+        ...(profile.models.list || []),
+      ]
         .filter(Boolean)
         .map((m) => m!.trim()),
     ),
   );
   const meta = filterModelMeta(profile.models.meta, list);
+  const defaultModel = profile.models.default.trim();
+  const smallModel = profile.models.smallModel?.trim() || undefined;
   const next: Profile = {
     ...profile,
     displayName: profile.displayName || profile.name,
     baseUrl: normalizeBaseUrlForFormat(profile.apiFormat, profile.baseUrl),
     apiKey: profile.apiKey ?? "",
     models: {
-      default: profile.models.default.trim(),
-      fast: profile.models.fast?.trim() || undefined,
+      default: defaultModel,
+      // Same as the default model → no point declaring a separate small model.
+      smallModel:
+        smallModel && smallModel !== defaultModel ? smallModel : undefined,
       list,
       meta,
     },
@@ -270,30 +301,52 @@ export function publicProfileView(profile: Profile) {
   };
 }
 
+/**
+ * Small model as stored on disk. Older profiles used `models.fast`; keep reading
+ * it so existing installs do not silently lose the setting after the rename.
+ */
+function legacySmallModel(raw: Profile): string | undefined {
+  const models = raw.models as
+    | (Partial<Profile["models"]> & { fast?: unknown })
+    | undefined;
+  const value = models?.smallModel ?? models?.fast;
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
 function normalizeProfile(raw: Profile, fallbackName: string): Profile {
   const name = raw.name || fallbackName;
+  // apiFormat 非法时不要透传成合法类型再等到 apply 才炸——那时用户已经改了一堆东西。
+  if (!isApiFormat(raw.apiFormat)) {
+    throw new Error(
+      `供应商「${name}」的 apiFormat「${String(raw.apiFormat)}」无效。` +
+        `可选：${API_FORMATS.join("、")}。请修正该 profile 或重新添加。`,
+    );
+  }
+  const apiFormat = raw.apiFormat;
   const list = Array.from(
     new Set(
       [
         raw.models?.default,
-        raw.models?.fast,
+        legacySmallModel(raw),
         ...(raw.models?.list || []),
       ]
         .filter(Boolean)
         .map((m) => String(m).trim()),
     ),
   );
+  const defaultModel = raw.models?.default || list[0] || "";
   return {
     name,
     displayName: raw.displayName || name,
-    apiFormat: raw.apiFormat,
-    baseUrl: isApiFormat(raw.apiFormat)
-      ? normalizeBaseUrlForFormat(raw.apiFormat, String(raw.baseUrl || ""))
-      : String(raw.baseUrl || "").replace(/\/+$/, ""),
+    apiFormat,
+    baseUrl: normalizeBaseUrlForFormat(apiFormat, String(raw.baseUrl || "")),
     apiKey: raw.apiKey ?? "",
     models: {
-      default: raw.models?.default || list[0] || "",
-      fast: raw.models?.fast || undefined,
+      default: defaultModel,
+      smallModel:
+        legacySmallModel(raw) && legacySmallModel(raw) !== defaultModel
+          ? legacySmallModel(raw)
+          : undefined,
       list: list.length ? list : raw.models?.default ? [raw.models.default] : [],
       meta: filterModelMeta(raw.models?.meta, list),
     },

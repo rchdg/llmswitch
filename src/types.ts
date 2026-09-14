@@ -54,9 +54,29 @@ export interface ModelMeta {
   cost?: ModelCost;
 }
 
+/**
+ * Tools whose config supports a second, lightweight model alongside the main
+ * one (title generation, summaries and other cheap tasks):
+ * - claude: ANTHROPIC_SMALL_FAST_MODEL / ANTHROPIC_DEFAULT_HAIKU_MODEL
+ * - opencode: top-level `small_model`
+ * Codex has no equivalent knob.
+ */
+const SMALL_MODEL_TOOLS = ["claude", "opencode"] as const;
+
+/** Whether `models.smallModel` is meaningful for the given tool. */
+export function supportsSmallModel(tool: Tool): boolean {
+  return (SMALL_MODEL_TOOLS as readonly Tool[]).includes(tool);
+}
+
 export interface ModelsConfig {
   default: string;
-  fast?: string;
+  /**
+   * Lightweight model for cheap tasks (title generation, summaries).
+   * Maps to `small_model` (OpenCode) and ANTHROPIC_SMALL_FAST_MODEL /
+   * ANTHROPIC_DEFAULT_HAIKU_MODEL (Claude Code). See supportsSmallModel().
+   * Read back-compatibly from the legacy `fast` field.
+   */
+  smallModel?: string;
   list: string[];
   /** Metadata per model id, fetched from models.lonae.com during selection. */
   meta?: Record<string, ModelMeta>;

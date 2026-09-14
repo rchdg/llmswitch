@@ -1,4 +1,3 @@
-import { existsSync, readFileSync } from "node:fs";
 import type { ApplyResult, Profile } from "../types.js";
 import { emptyProxy } from "../types.js";
 import { assertCompatible } from "../formats/compatibility.js";
@@ -7,7 +6,12 @@ import {
   ensureBridgeForProfile,
   profileNeedsBridge,
 } from "../bridge/manager.js";
-import { backupFile, atomicWriteFile } from "../utils/fs.js";
+import {
+  backupFile,
+  atomicWriteFile,
+  readStructuredFile,
+  stringRecordAt,
+} from "../utils/fs.js";
 import {
   applyProxyToEnvRecord,
   clearProxyEnvKeys,
@@ -43,8 +47,10 @@ type SettingsJson = {
 };
 
 export function readClaudeSettings(path = getClaudeSettingsPath()): SettingsJson {
-  if (!existsSync(path)) return {};
-  return JSON.parse(readFileSync(path, "utf8")) as SettingsJson;
+  return readStructuredFile(path, (text) => JSON.parse(text) as SettingsJson, {
+    label: "Claude Code 配置",
+    fallback: () => ({}),
+  });
 }
 
 function stripManagedEnv(env: Record<string, string>): Record<string, string> {
@@ -63,7 +69,7 @@ export function buildClaudeSettings(
 ): SettingsJson {
   assertCompatible("claude", profile.apiFormat);
 
-  const env = stripManagedEnv({ ...(existing.env || {}) });
+  const env = stripManagedEnv(stringRecordAt(existing, "env"));
   clearProxyEnvKeys(env);
 
   const needsBridge = profileNeedsBridge(profile);
@@ -74,9 +80,9 @@ export function buildClaudeSettings(
   env.ANTHROPIC_MODEL = profile.models.default;
   env.ANTHROPIC_DEFAULT_SONNET_MODEL = profile.models.default;
   env.ANTHROPIC_DEFAULT_OPUS_MODEL = profile.models.default;
-  if (profile.models.fast) {
-    env.ANTHROPIC_SMALL_FAST_MODEL = profile.models.fast;
-    env.ANTHROPIC_DEFAULT_HAIKU_MODEL = profile.models.fast;
+  if (profile.models.smallModel) {
+    env.ANTHROPIC_SMALL_FAST_MODEL = profile.models.smallModel;
+    env.ANTHROPIC_DEFAULT_HAIKU_MODEL = profile.models.smallModel;
   } else {
     env.ANTHROPIC_SMALL_FAST_MODEL = profile.models.default;
     env.ANTHROPIC_DEFAULT_HAIKU_MODEL = profile.models.default;
@@ -150,7 +156,7 @@ export async function deactivateClaudeProfile(): Promise<ApplyResult> {
     getBackupsDir("claude"),
     "settings",
   );
-  const env = stripManagedEnv({ ...(existing.env || {}) });
+  const env = stripManagedEnv(stringRecordAt(existing, "env"));
   clearProxyEnvKeys(env);
   const next: SettingsJson = { ...existing, env };
   if (Object.keys(env).length === 0) delete next.env;

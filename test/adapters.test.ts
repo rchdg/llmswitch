@@ -14,7 +14,11 @@ import {
 import {
   buildOpenCodeConfig,
   applyOpenCodeProfile,
+  deactivateOpenCodeProfile,
+  readOpenCodeConfig,
 } from "../src/adapters/opencode.ts";
+import { getOpenCodeConfigPath, getProfilesDir } from "../src/utils/paths.ts";
+import { atomicWriteFile } from "../src/utils/fs.ts";
 import { assertCompatible } from "../src/formats/compatibility.ts";
 import { buildProxyEnv } from "../src/utils/proxy.ts";
 
@@ -341,5 +345,122 @@ describe("opencode adapter", () => {
     saveProfile("opencode", profile);
     const result = await applyOpenCodeProfile(profile);
     expect(existsSync(result.configPath)).toBe(true);
+  });
+
+  test("small_model is written from models.smallModel", () => {
+    const profile = sample({
+      name: "sm",
+      apiFormat: "openai-chat",
+      models: {
+        default: "model-a",
+        smallModel: "model-mini",
+        list: ["model-a", "model-mini"],
+      },
+    });
+    const cfg = buildOpenCodeConfig({}, profile);
+    expect(cfg.model).toBe("llms-sm/model-a");
+    expect(cfg.small_model).toBe("llms-sm/model-mini");
+  });
+
+  test("small model is declared in the provider block even if absent from list", () => {
+    const profile = sample({
+      name: "sm2",
+      apiFormat: "openai-chat",
+      models: { default: "model-a", smallModel: "model-mini", list: ["model-a"] },
+    });
+    const cfg = buildOpenCodeConfig({}, profile);
+    const providers = cfg.provider as Record<string, Record<string, unknown>>;
+    const block = providers["llms-sm2"] as {
+      models: Record<string, Record<string, unknown>>;
+    };
+    expect(block.models["model-mini"]).toEqual({ name: "model-mini" });
+  });
+
+  test("clearing models.smallModel removes our own small_model", () => {
+    const profile = sample({
+      name: "sm",
+      apiFormat: "openai-chat",
+      models: { default: "model-a", list: ["model-a"] },
+    });
+    const cfg = buildOpenCodeConfig(
+      { small_model: "llms-sm/model-mini" },
+      profile,
+    );
+    expect(cfg.small_model).toBeUndefined();
+  });
+
+  test("small_model from another provider is preserved", () => {
+    const profile = sample({
+      name: "sm",
+      apiFormat: "openai-chat",
+      models: { default: "model-a", list: ["model-a"] },
+    });
+    const cfg = buildOpenCodeConfig(
+      { small_model: "anthropic/claude-haiku-4-5" },
+      profile,
+    );
+    expect(cfg.small_model).toBe("anthropic/claude-haiku-4-5");
+  });
+
+  test("deactivate drops model and small_model for that provider", () => {
+    const profile = sample({
+      name: "sm",
+      apiFormat: "openai-chat",
+      models: {
+        default: "model-a",
+        smallModel: "model-mini",
+        list: ["model-a", "model-mini"],
+      },
+    });
+    saveProfile("opencode", profile);
+    const written = buildOpenCodeConfig({}, profile);
+    atomicWriteFile(
+      getOpenCodeConfigPath(),
+      JSON.stringify(written, null, 2) + "\n",
+    );
+
+    deactivateOpenCodeProfile("sm");
+    const cfg = readOpenCodeConfig();
+    expect(cfg.model).toBeUndefined();
+    expect(cfg.small_model).toBeUndefined();
+    expect(cfg.provider).toEqual({});
+  });
+
+  test("store drops smallModel when it equals the default model", () => {
+    saveProfile(
+      "opencode",
+      sample({
+        name: "same",
+        apiFormat: "openai-chat",
+        models: { default: "model-a", smallModel: "model-a", list: ["model-a"] },
+      }),
+    );
+    expect(requireProfile("opencode", "same").models.smallModel).toBeUndefined();
+  });
+
+  // 字段从 fast 改名为 smallModel，磁盘上的老 profile 不能因此丢配置。
+  test("legacy `fast` field on disk is still read as smallModel", () => {
+    const dir = getProfilesDir("opencode");
+    atomicWriteFile(
+      join(dir, "legacy.json"),
+      JSON.stringify({
+        name: "legacy",
+        displayName: "Legacy",
+        apiFormat: "openai-chat",
+        baseUrl: "https://api.example.com/v1",
+        apiKey: "sk",
+        models: {
+          default: "model-a",
+          fast: "model-mini",
+          list: ["model-a", "model-mini"],
+        },
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    const loaded = requireProfile("opencode", "legacy");
+    expect(loaded.models.smallModel).toBe("model-mini");
+
+    const cfg = buildOpenCodeConfig({}, loaded);
+    expect(cfg.small_model).toBe("llms-legacy/model-mini");
   });
 });
