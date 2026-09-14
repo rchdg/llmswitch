@@ -145,6 +145,81 @@ describe("mapResponsesTools / collectCustomToolNames", () => {
   });
 });
 
+describe("reasoning_content passthrough (chat → responses)", () => {
+  // Regression: the chat→responses direction dropped reasoning entirely, so
+  // Codex never saw the chain of thought from reasoning models.
+  test("non-streaming reasoning_content becomes a reasoning output item", () => {
+    const resp = chatCompletionToResponse({
+      model: "deepseek-reasoner",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            reasoning_content: "先分解问题",
+            content: "答案是 4",
+          },
+          finish_reason: "stop",
+        },
+      ],
+    });
+    const output = resp.output as Array<Record<string, unknown>>;
+    const reasoning = output.find((item) => item.type === "reasoning");
+    expect(reasoning).toBeDefined();
+    expect(
+      (reasoning!.summary as Array<{ text: string }>)[0]!.text,
+    ).toBe("先分解问题");
+    // reasoning 必须排在正文 message 之前
+    expect(output.findIndex((i) => i.type === "reasoning")).toBeLessThan(
+      output.findIndex((i) => i.type === "message"),
+    );
+  });
+
+  test("streaming reasoning_content emits summary delta then closes before text", () => {
+    const state = createStreamState("m");
+    const frames = [
+      ...chatChunkToResponsesEvents(
+        { choices: [{ delta: { reasoning_content: "想一下" }, index: 0 }] },
+        state,
+      ),
+      ...chatChunkToResponsesEvents(
+        { choices: [{ delta: { content: "好" }, index: 0 }] },
+        state,
+      ),
+      ...chatChunkToResponsesEvents(
+        { choices: [{ delta: {}, finish_reason: "stop", index: 0 }] },
+        state,
+      ),
+    ].join("");
+
+    expect(frames).toContain("response.reasoning_summary_text.delta");
+    expect(frames).toContain("想一下");
+    expect(frames).toContain("response.reasoning_summary_text.done");
+    // reasoning 项要在正文 output_text 开始前收尾
+    expect(frames.indexOf("response.reasoning_summary_text.done")).toBeLessThan(
+      frames.indexOf("response.output_text.delta"),
+    );
+    expect(frames).toContain("response.completed");
+  });
+
+  test("reasoning-only reply still closes the reasoning item", () => {
+    const state = createStreamState("m");
+    const frames = [
+      ...chatChunkToResponsesEvents(
+        { choices: [{ delta: { reasoning_content: "只有推理" }, index: 0 }] },
+        state,
+      ),
+      ...chatChunkToResponsesEvents(
+        { choices: [{ delta: {}, finish_reason: "stop", index: 0 }] },
+        state,
+      ),
+    ].join("");
+    expect(frames).toContain("response.reasoning_summary_text.done");
+    expect(frames).toContain('"type":"reasoning"');
+    expect(frames).toContain("response.completed");
+  });
+});
+
 describe("chat stream → responses events", () => {
   test("emits text deltas and completed", () => {
     const state = createStreamState("m");

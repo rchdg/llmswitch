@@ -105,8 +105,28 @@ export function parseBridgeRuntimeLimits(
   return parsed;
 }
 
-export function parseBridgePort(value: string | number): number {
-  const raw = typeof value === "number" ? String(value) : value;
+/**
+ * Bounded in-flight request counter shared by the bridge and the gateway.
+ * `LLM_SWITCH_MAX_CONCURRENCY` is documented as applying to both, so both must
+ * actually enforce it.
+ */
+export class ConcurrencyGate {
+  private active = 0;
+  constructor(private readonly max: number) {}
+  get inFlight(): number {
+    return this.active;
+  }
+  tryAcquire(): boolean {
+    if (this.active >= this.max) return false;
+    this.active += 1;
+    return true;
+  }
+  release(): void {
+    if (this.active > 0) this.active -= 1;
+  }
+}
+
+export function parseBridgePort(value: string | number): number {  const raw = typeof value === "number" ? String(value) : value;
   if (!/^\d+$/.test(raw)) {
     throw new Error("Port 必须是 1..65535 范围内的整数");
   }

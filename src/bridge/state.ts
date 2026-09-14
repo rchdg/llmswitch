@@ -294,45 +294,81 @@ function persistState(next: BridgeRuntimeState): void {
  * revision must equal the on-disk revision (compare-and-set).
  */
 export function writeBridgeState(state: BridgeRuntimeState): BridgeRuntimeState {
-  const current = readBridgeState();
-  if (existsSync(getBridgeStatePath()) && state.revision !== current.revision) {
-    throw new BridgeStateConflictError(current.revision, state.revision);
-  }
-  const next = withFlatAliases({
-    version: STATE_VERSION,
-    revision: current.revision + 1,
-    listener: state.listener,
-    instance: state.instance,
-    upstreams: normalizeBridgeUpstreams(state.upstreams),
-    pending: state.pending,
+  return withBridgeLock(() => {
+    const current = readBridgeState();
+    if (
+      existsSync(getBridgeStatePath()) &&
+      state.revision !== current.revision
+    ) {
+      throw new BridgeStateConflictError(current.revision, state.revision);
+    }
+    const next = withFlatAliases({
+      version: STATE_VERSION,
+      revision: current.revision + 1,
+      listener: state.listener,
+      instance: state.instance,
+      upstreams: normalizeBridgeUpstreams(state.upstreams),
+      pending: state.pending,
+    });
+    persistState(next);
+    return next;
   });
-  persistState(next);
-  return next;
 }
 
 /**
  * Atomically mutate state under compare-and-set. `expectedRevision` defaults to
  * the current on-disk revision.
+ *
+ * The read-modify-write runs inside the on-disk bridge lock. Without it two
+ * concurrent `llms <tool> use` runs can interleave: both read the same revision,
+ * both write, and one side's upstream (or the daemon's instance identity) is
+ * lost — which then makes `bridge stop` unable to recognise the live daemon.
  */
 export function updateBridgeState(
   mutate: (current: BridgeRuntimeState) => BridgeRuntimeState,
   expectedRevision?: number,
 ): BridgeRuntimeState {
-  const current = readBridgeState();
-  if (expectedRevision !== undefined && expectedRevision !== current.revision) {
-    throw new BridgeStateConflictError(current.revision, expectedRevision);
-  }
-  const mutated = mutate(current);
-  const next = withFlatAliases({
-    version: STATE_VERSION,
-    revision: current.revision + 1,
-    listener: mutated.listener,
-    instance: mutated.instance,
-    upstreams: normalizeBridgeUpstreams(mutated.upstreams),
-    pending: mutated.pending,
+  return withBridgeLock(() => {
+    const current = readBridgeState();
+    if (
+      expectedRevision !== undefined &&
+      expectedRevision !== current.revision
+    ) {
+      throw new BridgeStateConflictError(current.revision, expectedRevision);
+    }
+    const mutated = mutate(current);
+    const next = withFlatAliases({
+      version: STATE_VERSION,
+      revision: current.revision + 1,
+      listener: mutated.listener,
+      instance: mutated.instance,
+      upstreams: normalizeBridgeUpstreams(mutated.upstreams),
+      pending: mutated.pending,
+    });
+    persistState(next);
+    return next;
   });
-  persistState(next);
-  return next;
+}
+
+/**
+ * Run `fn` while holding the exclusive bridge lock.
+ *
+ * Reentrant within a process: the file lock uses `flag: "wx"`, so a nested
+ * acquire from the same process would block until it timed out. A depth counter
+ * keeps nested writes (e.g. clearBridgeUpstream → stopBridge) working.
+ */
+let bridgeLockDepth = 0;
+
+export function withBridgeLock<T>(fn: () => T): T {
+  if (bridgeLockDepth > 0) return fn();
+  const lock = acquireBridgeLock();
+  bridgeLockDepth += 1;
+  try {
+    return fn();
+  } finally {
+    bridgeLockDepth -= 1;
+    lock.release();
+  }
 }
 
 // --- upstream facade (compat) ----------------------------------------------

@@ -1,8 +1,10 @@
 import { Command } from "commander";
 import {
+  bridgeToolForCliTool,
   ensureBridgeForProfile,
   isBridgeAlive,
   isPidRunning,
+  profileNeedsBridge,
   readPid,
   runBridgeForeground,
   startBridgeDaemon,
@@ -16,7 +18,7 @@ import {
 import { parseBridgePort } from "../bridge/runtime.js";
 import { DEFAULT_BRIDGE_HOST, DEFAULT_BRIDGE_PORT } from "../bridge/types.js";
 import { getActiveProfile, resolveProfileOrThrow } from "../store/profiles.js";
-import { isTool } from "../types.js";
+import { TOOLS, isTool } from "../types.js";
 
 export function registerBridgeCommand(program: Command): void {
   const bridge = program
@@ -119,7 +121,7 @@ export function registerBridgeCommand(program: Command): void {
       }
       console.log(`状态：${alive ? "运行中" : "未运行"}`);
       console.log(`根地址：${data.rootUrl}`);
-      console.log(`Codex/OpenCode base：${data.codexBaseUrl}`);
+      console.log(`OpenAI 兼容 base：${data.codexBaseUrl}`);
       console.log(`PID：${pid ?? "-"}`);
       for (const tool of ["codex", "claude", "opencode"] as const) {
         const u = data.upstreams[tool];
@@ -136,19 +138,30 @@ export function registerBridgeCommand(program: Command): void {
   bridge
     .command("reload")
     .description("用当前启用的 profile 刷新某一侧上游（不重启进程）")
-    .argument("[tool]", "claude 或 codex（默认 codex）", "codex")
+    .argument("[tool]", `claude | codex | opencode（默认 codex）`, "codex")
     .option("--profile <name>", "指定 profile")
     .action(async (toolArg: string, opts: { profile?: string }) => {
       const toolName = toolArg || "codex";
-      if (!isTool(toolName) || (toolName !== "codex" && toolName !== "claude")) {
-        throw new Error("tool 只能是 claude 或 codex");
+      if (!isTool(toolName)) {
+        throw new Error(`未知工具「${toolName}」。可选：${TOOLS.join("、")}`);
       }
-      const tool = toolName as "claude" | "codex";
+      // 三个工具都可能走 bridge（openai-chat 上游），reload 必须全部支持。
+      const tool = bridgeToolForCliTool(toolName);
+      if (!tool) {
+        throw new Error(`${toolName} 不使用本地 bridge`);
+      }
       const profile = opts.profile
         ? resolveProfileOrThrow(tool, opts.profile)
         : getActiveProfile(tool);
       if (!profile) {
-        throw new Error(`没有可用的 ${tool} profile`);
+        throw new Error(
+          `没有已启用的 ${tool} profile。可用：llms ${tool} use，或 llms bridge reload ${tool} --profile <name>`,
+        );
+      }
+      if (!profileNeedsBridge(profile)) {
+        throw new Error(
+          `${tool}/${profile.name} 是 ${profile.apiFormat} 原生直连，不经过 bridge，无需 reload。`,
+        );
       }
       const connection = await ensureBridgeForProfile(profile, tool);
       console.log(

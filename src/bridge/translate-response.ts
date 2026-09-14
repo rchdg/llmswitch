@@ -46,6 +46,10 @@ export interface StreamBridgeState {
   textItemId: string | null;
   textStarted: boolean;
   textContentIndex: number;
+  /** Reasoning channel (upstream `delta.reasoning_content`). */
+  reasoningItemId: string | null;
+  reasoningStarted: boolean;
+  reasoningText: string;
   outputIndex: number;
   currentText: string;
   completedItems: Array<{
@@ -87,6 +91,9 @@ export function createStreamState(
     textItemId: null,
     textStarted: false,
     textContentIndex: 0,
+    reasoningItemId: null,
+    reasoningStarted: false,
+    reasoningText: "",
     outputIndex: 0,
     currentText: "",
     completedItems: [],
@@ -209,6 +216,8 @@ function ensureCreated(state: StreamBridgeState, out: string[]): void {
 
 function ensureTextItem(state: StreamBridgeState, out: string[]): void {
   if (state.textStarted) return;
+  // reasoning 必须排在正文之前，先把它收尾再开正文项。
+  closeReasoningItem(state, out);
   state.textStarted = true;
   state.textItemId = newId("msg");
   state.currentText = "";
@@ -233,6 +242,90 @@ function ensureTextItem(state: StreamBridgeState, out: string[]): void {
       part: { type: "output_text", text: "", annotations: [] },
     }),
   );
+}
+
+/**
+ * Reasoning models on Chat Completions upstreams stream their chain of thought
+ * as `delta.reasoning_content`. Responses clients (Codex) expect it as a
+ * `reasoning` output item with summary text, so surface it instead of dropping it.
+ */
+function ensureReasoningItem(state: StreamBridgeState, out: string[]): void {
+  if (state.reasoningStarted) return;
+  state.reasoningStarted = true;
+  state.reasoningItemId = newId("rs");
+  state.reasoningText = "";
+  out.push(
+    sseEvent("response.output_item.added", {
+      output_index: state.outputIndex,
+      item: {
+        id: state.reasoningItemId,
+        type: "reasoning",
+        status: "in_progress",
+        summary: [],
+      },
+    }),
+  );
+  out.push(
+    sseEvent("response.reasoning_summary_part.added", {
+      item_id: state.reasoningItemId,
+      output_index: state.outputIndex,
+      summary_index: 0,
+      part: { type: "summary_text", text: "" },
+    }),
+  );
+}
+
+function emitReasoningDelta(
+  state: StreamBridgeState,
+  out: string[],
+  content: string,
+): void {
+  if (!content) return;
+  ensureReasoningItem(state, out);
+  state.reasoningText += content;
+  out.push(
+    sseEvent("response.reasoning_summary_text.delta", {
+      item_id: state.reasoningItemId,
+      output_index: state.outputIndex,
+      summary_index: 0,
+      delta: content,
+    }),
+  );
+}
+
+function closeReasoningItem(state: StreamBridgeState, out: string[]): void {
+  if (!state.reasoningStarted || !state.reasoningItemId) return;
+  const outputIndex = state.outputIndex;
+  const item = {
+    id: state.reasoningItemId,
+    type: "reasoning",
+    status: "completed",
+    summary: [{ type: "summary_text", text: state.reasoningText }],
+  };
+  out.push(
+    sseEvent("response.reasoning_summary_text.done", {
+      item_id: state.reasoningItemId,
+      output_index: outputIndex,
+      summary_index: 0,
+      text: state.reasoningText,
+    }),
+  );
+  out.push(
+    sseEvent("response.reasoning_summary_part.done", {
+      item_id: state.reasoningItemId,
+      output_index: outputIndex,
+      summary_index: 0,
+      part: { type: "summary_text", text: state.reasoningText },
+    }),
+  );
+  out.push(
+    sseEvent("response.output_item.done", { output_index: outputIndex, item }),
+  );
+  state.completedItems.push({ outputIndex, item });
+  state.outputIndex += 1;
+  state.reasoningStarted = false;
+  state.reasoningItemId = null;
+  state.reasoningText = "";
 }
 
 function emitTextDelta(
@@ -378,6 +471,16 @@ export function chatChunkToResponsesEvents(
     const choice = choiceRaw as Record<string, unknown>;
     const delta = (choice.delta || choice.message || {}) as Record<string, unknown>;
     const finish = choice.finish_reason as string | null | undefined;
+
+    const reasoningDelta =
+      typeof delta.reasoning_content === "string"
+        ? delta.reasoning_content
+        : typeof delta.reasoning === "string"
+          ? delta.reasoning
+          : "";
+    if (reasoningDelta) {
+      emitReasoningDelta(state, out, reasoningDelta);
+    }
 
     if (typeof delta.content === "string" && delta.content.length > 0) {
       consumeTextContent(state, out, delta.content);
@@ -570,6 +673,8 @@ function finalizeStream(
   if (state.textStarted && state.textItemId) {
     closeTextItem(state, out);
   }
+  // 只有 reasoning 没有正文的回复（或工具调用前只推理）也要把 reasoning 收尾。
+  closeReasoningItem(state, out);
 
   for (const entry of state.toolCalls.values()) {
     if (!entry.started) continue;
@@ -698,6 +803,23 @@ export function chatCompletionToResponse(
     typeof message.content === "string"
       ? message.content
       : textFromCompletions;
+
+  // 推理模型在 Chat 上游用 reasoning_content 返回思维链；Responses 客户端
+  // （Codex）读的是 reasoning 输出项，之前这段内容被整体丢弃。
+  const reasoningText =
+    typeof message.reasoning_content === "string"
+      ? message.reasoning_content
+      : typeof message.reasoning === "string"
+        ? message.reasoning
+        : "";
+  if (reasoningText) {
+    output.push({
+      id: newId("rs"),
+      type: "reasoning",
+      status: "completed",
+      summary: [{ type: "summary_text", text: reasoningText }],
+    });
+  }
 
   for (const segment of splitWebSearchContent(content, webSearchEnabled)) {
     if (segment.type === "web_search") {

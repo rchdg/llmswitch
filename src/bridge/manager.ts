@@ -306,9 +306,18 @@ export async function stopBridge(): Promise<boolean> {
     state.listener.advertiseHost,
     state.listener.port,
   );
+
+  // daemon 已经死了（端口不通且 pid 不在），但 state 里还留着实例记录。
+  // 之前这种情况会一直抛「无法验证身份」，导致 stop 永远失败、start 也走偏。
+  if (!probe.reachable && !isPidRunning(instance.pid)) {
+    updateBridgeState((current) => ({ ...current, instance: null, pid: null }));
+    return false;
+  }
+
   if (!probe.authenticated || probe.instanceId !== instance.id) {
     throw new BridgeControlError(
-      "无法验证 bridge 实例身份；为避免误杀，未发送任何进程信号。",
+      "无法验证 bridge 实例身份；为避免误杀，未发送任何进程信号。" +
+        "若确认该端口上的进程与本工具无关，请改用其他端口（LLM_SWITCH_BRIDGE_PORT）。",
     );
   }
   let response: Response;

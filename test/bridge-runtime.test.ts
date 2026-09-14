@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  ConcurrencyGate,
   DEFAULT_BRIDGE_RUNTIME_LIMITS,
   advertiseHostForBind,
   assertBridgeListenerAllowed,
@@ -10,6 +11,26 @@ import {
   parseBridgeRuntimeLimits,
   resolveBridgeListener,
 } from "../src/bridge/runtime.ts";
+
+describe("ConcurrencyGate", () => {
+  test("refuses beyond the limit and recovers after release", () => {
+    const gate = new ConcurrencyGate(2);
+    expect(gate.tryAcquire()).toBe(true);
+    expect(gate.tryAcquire()).toBe(true);
+    expect(gate.inFlight).toBe(2);
+    expect(gate.tryAcquire()).toBe(false);
+    gate.release();
+    expect(gate.tryAcquire()).toBe(true);
+  });
+
+  test("release never underflows", () => {
+    const gate = new ConcurrencyGate(1);
+    gate.release();
+    gate.release();
+    expect(gate.inFlight).toBe(0);
+    expect(gate.tryAcquire()).toBe(true);
+  });
+});
 
 describe("bridge host primitives", () => {
   test("recognizes only the specified loopback forms", () => {

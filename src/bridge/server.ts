@@ -4,7 +4,7 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
-import { parseBridgeRuntimeLimits } from "./runtime.js";
+import { ConcurrencyGate, parseBridgeRuntimeLimits } from "./runtime.js";
 import {
   requestWithNodeTransport,
   type NodeTransportResponse,
@@ -204,9 +204,10 @@ function requestUpstream(
 
 async function fetchModelsJson(
   upstream: BridgeUpstream,
+  signal?: AbortSignal,
 ): Promise<{ ok: boolean; status: number; data: unknown[] }> {
   const url = joinUrl(upstream.baseUrl, "/models");
-  const response = await requestUpstream(upstream, url, "GET");
+  const response = await requestUpstream(upstream, url, "GET", undefined, signal);
   if (!response.ok) {
     return { ok: false, status: response.status, data: [] };
   }
@@ -222,6 +223,7 @@ async function proxyModelsMerged(
   _req: IncomingMessage,
   res: ServerResponse,
   upstreams: BridgeUpstreams,
+  signal?: AbortSignal,
 ): Promise<void> {
   const sides = [upstreams.codex, upstreams.claude, upstreams.opencode].filter(
     (u): u is BridgeUpstream => Boolean(u?.baseUrl),
@@ -234,7 +236,7 @@ async function proxyModelsMerged(
   }
 
   const results = await Promise.all(
-    sides.map((u) => fetchModelsJson(u).catch(() => ({
+    sides.map((u) => fetchModelsJson(u, signal).catch(() => ({
       ok: false as const,
       status: 502,
       data: [] as unknown[],
@@ -269,6 +271,7 @@ async function handleResponses(
   res: ServerResponse,
   upstream: BridgeUpstream,
   bodyBuf: Buffer,
+  signal?: AbortSignal,
 ): Promise<void> {
   let body: Record<string, unknown>;
   try {
@@ -282,11 +285,11 @@ async function handleResponses(
   const wantStream = Boolean(body.stream);
 
   if (mode === "completions") {
-    await forwardCompletions(req, res, upstream, body, wantStream);
+    await forwardCompletions(req, res, upstream, body, wantStream, signal);
     return;
   }
 
-  await forwardChatResponses(req, res, upstream, body, wantStream);
+  await forwardChatResponses(req, res, upstream, body, wantStream, signal);
 }
 
 async function handleMessages(
@@ -294,6 +297,7 @@ async function handleMessages(
   res: ServerResponse,
   upstream: BridgeUpstream,
   bodyBuf: Buffer,
+  signal?: AbortSignal,
 ): Promise<void> {
   let body: Record<string, unknown>;
   try {
@@ -317,6 +321,7 @@ async function handleMessages(
       url,
       "POST",
       JSON.stringify(chatReq),
+      signal,
     );
   } catch (err) {
     sendJson(res, 502, {
@@ -362,6 +367,7 @@ async function forwardChatResponses(
   upstream: BridgeUpstream,
   body: Record<string, unknown>,
   wantStream: boolean,
+  signal?: AbortSignal,
 ): Promise<void> {
   const chatReq = responsesToChatRequest(body);
   const customTools = collectCustomToolNames(body.tools);
@@ -374,6 +380,7 @@ async function forwardChatResponses(
       url,
       "POST",
       JSON.stringify(chatReq),
+      signal,
     );
   } catch (err) {
     sendJson(res, 502, {
@@ -432,6 +439,7 @@ async function forwardOpenCodeChat(
   res: ServerResponse,
   upstream: BridgeUpstream,
   bodyBuf: Buffer,
+  signal?: AbortSignal,
 ): Promise<void> {
   let body: Record<string, unknown>;
   try {
@@ -451,6 +459,7 @@ async function forwardOpenCodeChat(
       url,
       "POST",
       bodyBuf.toString("utf8"),
+      signal,
     );
   } catch (err) {
     sendJson(res, 502, {
@@ -490,6 +499,7 @@ async function forwardCompletions(
   upstream: BridgeUpstream,
   body: Record<string, unknown>,
   wantStream: boolean,
+  signal?: AbortSignal,
 ): Promise<void> {  const completionReq = responsesToCompletionsRequest(body);
   const customTools = collectCustomToolNames(body.tools);
   const url = joinUrl(upstream.baseUrl, "/completions");
@@ -501,6 +511,7 @@ async function forwardCompletions(
       url,
       "POST",
       JSON.stringify(completionReq),
+      signal,
     );
   } catch (err) {
     sendJson(res, 502, {
@@ -710,7 +721,45 @@ async function pipeRawStream(
 }
 
 export function createBridgeServer(options: BridgeServerOptions = {}): Server {
+  const limits = parseBridgeRuntimeLimits();
+  // LLM_SWITCH_MAX_CONCURRENCY 文档上说与 gateway 共用，之前 bridge 侧只解析不执行。
+  const gate = new ConcurrencyGate(limits.maxConcurrency);
+
   return createServer(async (req, res) => {
+    // 客户端断开（Ctrl-C）后必须把上游请求也取消掉，否则 bridge 会一直把流读到
+    // idle/total 超时，白白消耗上游 token 与连接。
+    //
+    // 注意运行时差异：Node 会在客户端掉线时给 ServerResponse 发 "close"，
+    // 但 Bun 的 node:http 不发（只有 req 的 "aborted" 与 socket 的 "close"）。
+    // bridge 守护进程两种运行时都可能跑，所以三个信号都监听，并用
+    // writableFinished 兜底避免正常收尾时误取消。
+    const controller = new AbortController();
+    const abort = () => {
+      if (res.writableFinished) return;
+      controller.abort();
+    };
+    const socket = res.socket;
+    res.on("close", abort);
+    req.on("aborted", abort);
+    socket?.on("close", abort);
+    const signal = controller.signal;
+
+    const isDataPlane =
+      req.method === "POST" &&
+      /^\/(v1\/)?(responses|messages|chat\/completions|completions)$/.test(
+        (req.url || "/").split("?")[0]!.replace(/\/+$/, "") || "/",
+      );
+    if (isDataPlane && !gate.tryAcquire()) {
+      res.setHeader("Retry-After", "1");
+      sendJson(res, 503, {
+        error: {
+          code: "too_many_concurrent_requests",
+          message: `并发请求数已达上限 ${limits.maxConcurrency}（LLM_SWITCH_MAX_CONCURRENCY 可调整）`,
+        },
+      });
+      return;
+    }
+
     try {
       const state = readBridgeState();
       const expectedControlToken =
@@ -817,7 +866,7 @@ export function createBridgeServer(options: BridgeServerOptions = {}): Server {
           });
           return;
         }
-        await proxyModelsMerged(req, res, merged);
+        await proxyModelsMerged(req, res, merged, signal);
         return;
       }
 
@@ -844,7 +893,7 @@ export function createBridgeServer(options: BridgeServerOptions = {}): Server {
           return;
         }
         const body = await readBody(req);
-        await handleResponses(req, res, merged.codex, body);
+        await handleResponses(req, res, merged.codex, body, signal);
         return;
       }
 
@@ -874,7 +923,7 @@ export function createBridgeServer(options: BridgeServerOptions = {}): Server {
           return;
         }
         const body = await readBody(req);
-        await handleMessages(req, res, merged.claude, body);
+        await handleMessages(req, res, merged.claude, body, signal);
         return;
       }
 
@@ -901,7 +950,7 @@ export function createBridgeServer(options: BridgeServerOptions = {}): Server {
           return;
         }
         const body = await readBody(req);
-        await forwardOpenCodeChat(req, res, merged.opencode, body);
+        await forwardOpenCodeChat(req, res, merged.opencode, body, signal);
         return;
       }
 
@@ -911,6 +960,8 @@ export function createBridgeServer(options: BridgeServerOptions = {}): Server {
         },
       });
     } catch (err) {
+      // 客户端已经走了就没人读响应了，不必再写。
+      if (signal.aborted || res.writableEnded) return;
       if (err instanceof RequestBodyTooLargeError) {
         sendJson(res, 413, {
           error: { code: "request_too_large", message: err.message },
@@ -922,6 +973,11 @@ export function createBridgeServer(options: BridgeServerOptions = {}): Server {
           message: err instanceof Error ? err.message : String(err),
         },
       });
+    } finally {
+      res.off("close", abort);
+      req.off("aborted", abort);
+      socket?.off("close", abort);
+      if (isDataPlane) gate.release();
     }
   });
 }
