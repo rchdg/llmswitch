@@ -94,6 +94,40 @@ export function selectProxyUrl(
  * Build a fresh per-request Agent for the given proxy URL. Callers own its
  * lifecycle and must call `.destroy()` once the response is drained.
  */
+/**
+ * Proxy agents are cached and keep-alive.
+ *
+ * A fresh Agent per request meant a new TCP+TLS (and CONNECT) handshake for
+ * every upstream call, which is significant on chatty streaming workloads.
+ * Cached agents are shared, so they must never be destroyed on a single
+ * request's failure — Node's Agent already evicts broken sockets itself.
+ * Keyed by proxy URL because socks5 vs socks5h changes DNS resolution.
+ */
+const proxyAgentCache = new Map<string, Agent>();
+const PROXY_AGENT_CACHE_MAX = 16;
+
+export function getProxyAgent(target: URL, proxyUrl: string): Agent {
+  const key = `${proxyUrl}|${target.protocol}`;
+  const cached = proxyAgentCache.get(key);
+  if (cached) return cached;
+  const agent = createTransportAgent(target, proxyUrl);
+  if (proxyAgentCache.size >= PROXY_AGENT_CACHE_MAX) {
+    // 简单淘汰：清掉最早插入的一个，避免无界增长。
+    const oldest = proxyAgentCache.keys().next().value;
+    if (oldest !== undefined) proxyAgentCache.delete(oldest);
+  }
+  proxyAgentCache.set(key, agent);
+  return agent;
+}
+
+/** Test seam: drop cached agents. */
+export function clearProxyAgentCache(): void {
+  for (const agent of proxyAgentCache.values()) {
+    (agent as { destroy?: () => void }).destroy?.();
+  }
+  proxyAgentCache.clear();
+}
+
 export function createTransportAgent(_target: URL, proxyUrl: string): Agent {
   let proxy: URL;
   try {
@@ -107,10 +141,10 @@ export function createTransportAgent(_target: URL, proxyUrl: string): Agent {
     );
   }
   if (proxy.protocol === "http:" || proxy.protocol === "https:") {
-    return new HttpsProxyAgent(proxy);
+    return new HttpsProxyAgent(proxy, { keepAlive: true });
   }
   // socks5 resolves DNS locally; socks5h/socks4a defer to the proxy.
-  return new SocksProxyAgent(proxy);
+  return new SocksProxyAgent(proxy, { keepAlive: true });
 }
 
 function sanitizeHeaders(
@@ -342,7 +376,8 @@ function performRequest(
   options: TransportRequestOptions,
 ): Promise<RequestOutcome> {
   const proxyUrl = selectProxyUrl(target, options.proxy);
-  const agent = proxyUrl ? createTransportAgent(target, proxyUrl) : undefined;
+  // 复用同一个代理 Agent（keep-alive）；无代理时走 Node 全局 agent，本身已 keep-alive。
+  const agent = proxyUrl ? getProxyAgent(target, proxyUrl) : undefined;
   const isHttps = target.protocol === "https:";
   const requestImpl = isHttps ? httpsRequest : httpRequest;
 
@@ -372,11 +407,8 @@ function performRequest(
       },
     };
 
-    const cleanupAgent = () => {
-      if (agent && typeof (agent as { destroy?: () => void }).destroy === "function") {
-        (agent as { destroy: () => void }).destroy();
-      }
-    };
+    // Agent 是共享的，单个请求失败不能销毁它，否则会连带打断其他在途请求。
+    const cleanupAgent = () => {};
 
     const fail = (err: Error) => {
       if (settled) return;

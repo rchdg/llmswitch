@@ -336,4 +336,30 @@ describe("node transport behavior", () => {
     setTimeout(() => controller.abort(), 20);
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
   });
+
+  // 这一条对应“客户端中途断开”：响应头已到、正在读流时取消，
+  // 必须让 body 读取失败并断掉上游连接，而不是把流读到 idle/total 超时。
+  test("aborting mid-stream errors the body reader", async () => {
+    const target = createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write("data: first\n\n");
+      // 永不结束
+    });
+    const port = await listen(target);
+    const controller = new AbortController();
+    const response = await requestWithNodeTransport({
+      url: `http://127.0.0.1:${port}/`,
+      signal: controller.signal,
+      idleTimeoutMs: 5_000,
+      totalTimeoutMs: 10_000,
+    });
+    expect(response.ok).toBe(true);
+
+    const reader = response.body!.getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value)).toContain("first");
+
+    controller.abort();
+    await expect(reader.read()).rejects.toBeTruthy();
+  });
 });
