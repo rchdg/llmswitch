@@ -19,7 +19,11 @@
     "start": "bun run ./src/index.ts",
     "test": "bun test",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "prepublishOnly": "bun run typecheck && bun run build"
+    "lint": "biome lint src test scripts",
+    "lint:fix": "biome lint --write src test scripts",
+    "format": "biome format --write src test scripts",
+    "verify": "bun run typecheck && bun run lint && bun test",
+    "prepublishOnly": "bun run typecheck && bun run lint && bun run build"
   },
   "engines": {
     "node": ">=20"
@@ -45,6 +49,7 @@
     "socks-proxy-agent": "8.0.5"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.3.14",
     "@types/bun": "^1.2.19",
     "@types/node": "^24.0.0",
     "typescript": "^5.8.3"

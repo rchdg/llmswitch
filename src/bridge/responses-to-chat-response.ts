@@ -411,7 +411,7 @@ export function responsesEventToChatChunks(
     const itemId = String(item.id || "");
     const entry = toolEntryFor(state, itemId);
     // Non-streamed argument payloads only appear on the done event.
-    if (entry && entry.custom && entry.customInput) {
+    if (entry?.custom && entry.customInput) {
       out.push(
         chunk(state, {
           tool_calls: [
