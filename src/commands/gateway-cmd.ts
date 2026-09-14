@@ -1,5 +1,5 @@
 import { Command, Option } from "commander";
-import { cancel, confirm, isCancel, password, select, text } from "@clack/prompts";
+import { confirm, isCancel, password, select, text } from "@clack/prompts";
 import {
   closeSync,
   existsSync,
@@ -50,6 +50,7 @@ import {
   updateGatewayKey,
 } from "../gateway/keys.js";
 import { parseBridgeRuntimeLimits } from "../bridge/runtime.js";
+import { renderTable } from "../utils/display.js";
 import { rotateGatewayLogIfNeeded } from "../gateway/manager.js";
 import {
   deleteGatewayProvider,
@@ -64,7 +65,12 @@ import {
   saveGatewayRoute,
   writeGatewayConfig,
 } from "../gateway/store.js";
-import { listRoutableModelIds, listRoutableModels, resolveModelRoute } from "../gateway/router.js";
+import {
+  listRoutableModelIds,
+  listRoutableModels,
+  resolveModelRoute,
+  splitQualified,
+} from "../gateway/router.js";
 import { resetUsage, summarizeUsage } from "../gateway/usage.js";
 import {
   DEFAULT_GATEWAY_HOST,
@@ -72,8 +78,24 @@ import {
   type GatewayProvider,
 } from "../gateway/types.js";
 
+/**
+ * `path=` marker for the provider list. `v1` is the default and stays implicit;
+ * an empty prefix means "hit baseUrl directly" and must be shown — the previous
+ * condition excluded the empty string, so that case silently rendered nothing.
+ */
+function formatPathPrefix(pathPrefix: string | undefined): string {
+  if (pathPrefix === undefined || pathPrefix === "v1") return "";
+  return pathPrefix === "" ? " path=(直连)" : ` path=${pathPrefix}`;
+}
+
+/**
+ * Abort a gateway command. Uses the same `错误：` prefix on stderr as the rest of
+ * the CLI (see cli.ts) instead of clack's boxed output, so piped consumers get a
+ * consistent, parseable line. Cancellations are printed as-is.
+ */
 function bail(message: string): never {
-  cancel(message);
+  if (message === "已取消") console.error(message);
+  else console.error(`错误：${message}`);
   process.exit(1);
 }
 
@@ -289,13 +311,17 @@ function registerUsageCommands(gateway: Command): void {
         return;
       }
       console.log(`统计范围：最近 ${days} 天\n`);
-      console.log(
-        "日期        请求数  输入tokens  输出tokens  Key      供应商        模型",
-      );
-      for (const row of rows) {
-        console.log(
-          `${row.day}  ${String(row.requests).padStart(5)}  ${String(row.inputTokens).padStart(10)}  ${String(row.outputTokens).padStart(10)}  ${row.key.padEnd(8)} ${row.provider.padEnd(12)} ${row.model}`,
-        );
+      // 中文表头占两列宽，用 padEnd 会错位，改按显示宽度排版。
+      for (const line of renderTable(rows, [
+        { header: "日期", value: (r) => r.day },
+        { header: "请求数", value: (r) => String(r.requests), align: "right" },
+        { header: "输入 tokens", value: (r) => String(r.inputTokens), align: "right" },
+        { header: "输出 tokens", value: (r) => String(r.outputTokens), align: "right" },
+        { header: "Key", value: (r) => r.key },
+        { header: "供应商", value: (r) => r.provider },
+        { header: "模型", value: (r) => r.model },
+      ])) {
+        console.log(line);
       }
     });
 
@@ -390,6 +416,12 @@ function registerServerCommands(gateway: Command): void {
       const data = {
         alive: probe.healthy,
         reachable: probe.reachable,
+        // 文本区区分三态，JSON 之前只有两个布尔，脚本无法还原「端口被占用」。
+        state: probe.healthy
+          ? ("running" as const)
+          : probe.reachable
+            ? ("port_occupied" as const)
+            : ("stopped" as const),
         listener: state.listener,
         rootUrl: gatewayRootUrl(state),
         openaiBaseUrl: gatewayBaseUrl(state),
@@ -407,7 +439,15 @@ function registerServerCommands(gateway: Command): void {
         console.log(JSON.stringify(data, null, 2));
         return;
       }
-      console.log(`状态：${data.alive ? "运行中" : data.reachable ? "端口被占用（非本网关）" : "未运行"}`);
+      console.log(
+        `状态：${
+          data.state === "running"
+            ? "运行中"
+            : data.state === "port_occupied"
+              ? "端口被占用（非本网关）"
+              : "未运行"
+        }`,
+      );
       if (data.alive && probe.uptimeSeconds !== undefined) {
         console.log(`已运行：${formatDuration(probe.uptimeSeconds)}`);
       }
@@ -512,7 +552,7 @@ function registerProviderCommands(gateway: Command): void {
       }
       for (const item of providers) {
         console.log(
-          `${item.enabled ? "●" : "○"} ${item.name}（${item.displayName}） ${item.apiFormat} ${item.baseUrl} key=${item.apiKey} priority=${item.priority} models=${item.models.length}${item.pathPrefix && item.pathPrefix !== "v1" ? ` path=${item.pathPrefix || "(直连)"}` : ""}${item.headerNames?.length ? ` headers=${item.headerNames.join("/")}` : ""}`,
+          `${item.enabled ? "●" : "○"} ${item.name}（${item.displayName}） ${item.apiFormat} ${item.baseUrl} key=${item.apiKey} priority=${item.priority} models=${item.models.length}${formatPathPrefix(item.pathPrefix)}${item.headerNames?.length ? ` headers=${item.headerNames.join("/")}` : ""}`,
         );
       }
     });
@@ -543,10 +583,13 @@ function registerProviderCommands(gateway: Command): void {
         .default({}),
     )
     .action(async (opts: Record<string, string | undefined> & { header?: Record<string, string> }) => {
-      const baseUrl = opts.baseUrl ?? (await promptText("API 地址（base URL）"));
+      const baseUrl =
+        opts.baseUrl ??
+        (await promptText("API 地址（base URL）", "请改用 --base-url <url>。"));
       if (!baseUrl) bail("已取消");
       const apiKey =
-        opts.apiKey ?? (await promptSecret("API Key（本地上游可留空）"));
+        opts.apiKey ??
+        (await promptSecret("API Key（本地上游可留空）", "请改用 --api-key <key>。"));
 
       let apiFormat: ApiFormat;
       if (opts.format) {
@@ -703,17 +746,21 @@ function registerProviderCommands(gateway: Command): void {
         }
       }
 
+      const models = result.modelsEndpoint as { ok: boolean; count?: number; error?: string };
+      const completion = result.completion as { ok?: boolean; status?: number; latencyMs?: number; error?: string } | undefined;
+      // 退出码要在 JSON 分支之前决定，否则脚本用 --json 时拿不到失败信号。
+      const allOk = models?.ok && (!completion || completion.ok);
+      if (!allOk) process.exitCode = 1;
+
       if (opts.json) {
-        console.log(JSON.stringify(result, null, 2));
+        console.log(JSON.stringify({ ...result, ok: Boolean(allOk) }, null, 2));
         return;
       }
-      const models = result.modelsEndpoint as { ok: boolean; count?: number; error?: string };
       if (models?.ok) {
         console.log(`模型列表：OK（${models.count} 个，${result.modelsLatencyMs}ms）`);
       } else {
         console.log(`模型列表：失败 — ${models?.error ?? "未知错误"}`);
       }
-      const completion = result.completion as { ok?: boolean; status?: number; latencyMs?: number; error?: string } | undefined;
       if (completion) {
         if (completion.ok) {
           console.log(`补全请求：OK（HTTP ${completion.status}，${completion.latencyMs}ms）`);
@@ -721,8 +768,6 @@ function registerProviderCommands(gateway: Command): void {
           console.log(`补全请求：失败 — ${completion.error ?? `HTTP ${completion.status}`}`);
         }
       }
-      const allOk = models?.ok && (!completion || completion.ok);
-      if (!allOk) process.exitCode = 1;
     });
 
   provider
@@ -963,6 +1008,10 @@ function registerKeyCommands(gateway: Command): void {
       "每分钟请求上限；-1 表示完全不限流，0 表示继承全局默认",
     )
     .option(
+      "--daily-requests <n>",
+      "每日请求配额（UTC 日重置，0 表示不限）",
+    )
+    .option(
       "--expires-in-days <n>",
       "新的有效期天数（从现在起算）；0 表示永不过期",
     )
@@ -992,11 +1041,11 @@ function registerKeyCommands(gateway: Command): void {
         patch.expiresInDays = value;
       }
       if (!Object.keys(patch).length) {
-        bail("没有指定任何修改项；可用 --name/--providers/--models/--formats/--rate-limit/--expires-in-days");
+        bail("没有指定任何修改项；可用 --name/--providers/--models/--formats/--rate-limit/--daily-requests/--expires-in-days");
       }
       const updated = updateGatewayKey(idOrName, patch);
       console.log(`已更新 ${updated.id}（${updated.name}）`);
-      console.log(JSON.stringify(publicKeyView(updated), null, 2));
+      console.log("当前作用域与限额：llms gateway key list");
     });
 
   key
@@ -1084,12 +1133,10 @@ function registerRouteCommands(gateway: Command): void {
         opts: { provider: string; model?: string; fallback?: string },
       ) => {
         const fallbacks = splitList(opts.fallback).map((entry) => {
-          const index = entry.indexOf("/");
-          if (index <= 0) return { provider: entry };
-          return {
-            provider: entry.slice(0, index),
-            model: entry.slice(index + 1),
-          };
+          // 与 router 解析请求模型 id 的规则保持一致：provider/model 与
+          // provider:model 都认，否则用户按文档写 `provider:model` 会被静默错配。
+          const qualified = splitQualified(entry);
+          return qualified ? qualified : { provider: entry };
         });
         const saved = saveGatewayRoute({
           alias,
@@ -1124,10 +1171,45 @@ function registerConfigCommands(gateway: Command): void {
   config
     .command("show", { isDefault: true })
     .description("显示当前配置与生效的运行时限额")
-    .action(() => {
+    .option("--json", "JSON 输出")
+    .action((opts: { json?: boolean }) => {
       const config = readGatewayConfig();
       const limits = parseBridgeRuntimeLimits();
-      console.log(JSON.stringify({ config, runtimeLimits: limits }, null, 2));
+      if (opts.json) {
+        console.log(JSON.stringify({ config, runtimeLimits: limits }, null, 2));
+        return;
+      }
+      // 其他命令都是「文本为主，--json 可选」，这里以前只吐 JSON，风格不一致。
+      console.log(`兜底供应商：${config.defaultProvider ?? "（未设置）"}`);
+      console.log(
+        `默认限流：${config.rateLimitPerMinute > 0 ? `${config.rateLimitPerMinute} 次/分钟` : "不限"}`,
+      );
+      console.log(
+        `Provider fallback：${config.fallback.enabled ? "启用" : "关闭"}` +
+          `（最多尝试 ${config.fallback.maxAttempts} 个上游，触发状态码 ${config.fallback.retryStatuses.join("/") || "无"}）`,
+      );
+      console.log(
+        `CORS 来源：${config.corsOrigins?.length ? config.corsOrigins.join(", ") : "（未开启）"}`,
+      );
+      console.log("");
+      console.log("运行时限额（环境变量可调，与 bridge 共用）：");
+      for (const line of renderTable(
+        [
+          { k: "最大并发", v: String(limits.maxConcurrency), env: "LLM_SWITCH_MAX_CONCURRENCY" },
+          { k: "请求体上限", v: `${limits.maxBodyBytes} B`, env: "LLM_SWITCH_MAX_BODY_BYTES" },
+          { k: "上游响应上限", v: `${limits.maxResponseBytes} B`, env: "LLM_SWITCH_MAX_RESPONSE_BYTES" },
+          { k: "连接超时", v: `${limits.connectTimeoutMs} ms`, env: "LLM_SWITCH_CONNECT_TIMEOUT_MS" },
+          { k: "流式空闲超时", v: `${limits.idleTimeoutMs} ms`, env: "LLM_SWITCH_IDLE_TIMEOUT_MS" },
+          { k: "单请求总超时", v: `${limits.totalTimeoutMs} ms`, env: "LLM_SWITCH_TOTAL_TIMEOUT_MS" },
+        ],
+        [
+          { header: "项目", value: (r) => r.k },
+          { header: "当前值", value: (r) => r.v, align: "right" },
+          { header: "环境变量", value: (r) => r.env },
+        ],
+      )) {
+        console.log(`  ${line}`);
+      }
     });
 
   config
@@ -1183,25 +1265,40 @@ function registerConfigCommands(gateway: Command): void {
       }
 
       writeGatewayConfig(next);
-      console.log(JSON.stringify(readGatewayConfig(), null, 2));
+      console.log("已更新网关配置。当前生效值：llms gateway config show");
     });
 }
 
 // --- prompts ----------------------------------------------------------------
 
-async function promptText(message: string): Promise<string> {
+/**
+ * clack 在非 TTY 下会永久等待输入，表现为「命令卡住」而不是报错。
+ * 每个交互入口先在这里挡一次，并说明该用哪个参数改成非交互。
+ */
+function requireTty(what: string, hint: string): void {
+  if (process.stdin.isTTY) return;
+  bail(`${what}需要交互式终端（当前 stdin 不是 TTY）。${hint}`);
+}
+
+async function promptText(message: string, hint?: string): Promise<string> {
+  requireTty(message, hint ?? "请在终端中运行，或改用对应命令行参数。");
   const value = await text({ message });
   if (isCancel(value)) bail("已取消");
   return String(value ?? "").trim();
 }
 
-async function promptSecret(message: string): Promise<string> {
+async function promptSecret(message: string, hint?: string): Promise<string> {
+  requireTty(message, hint ?? "请在终端中运行，或改用对应命令行参数。");
   const value = await password({ message });
   if (isCancel(value)) bail("已取消");
   return String(value ?? "").trim();
 }
 
 async function promptFormat(): Promise<ApiFormat> {
+  requireTty(
+    "接口类型选择",
+    "自动探测失败，请改用 --format <openai-chat|anthropic|openai-responses>。",
+  );
   const value = await select({
     message: "无法自动识别接口类型，请选择",
     options: [

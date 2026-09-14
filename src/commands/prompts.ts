@@ -8,6 +8,7 @@ import type {
 } from "../types.js";
 import { normalizeProxyValue } from "../types.js";
 import { isApiFormat } from "../types.js";
+import { supportsSmallModel } from "../types.js";
 import { formatLabel, supportedFormats } from "../formats/compatibility.js";
 import { getPreset, presetsForTool } from "../presets/index.js";
 import { detectApiFormat } from "../utils/detect-format.js";
@@ -32,6 +33,22 @@ import { maskSecret } from "../utils/fs.js";
 
 export function isCancel(value: unknown): boolean {
   return p.isCancel(value);
+}
+
+/**
+ * Guard every interactive entry point.
+ *
+ * @clack/prompts silently waits forever when stdin is not a TTY (pipes, CI,
+ * `</dev/null`). The failure mode is "the command hangs", which is far worse
+ * than an error, so refuse up front and name the flags that make the command
+ * non-interactive.
+ */
+export function requireInteractive(what: string, hint?: string): void {
+  if (process.stdin.isTTY) return;
+  throw new Error(
+    `${what}需要交互式终端，但当前 stdin 不是 TTY。` +
+      (hint ? `${hint}` : "请在终端中直接运行，或改用带参数的非交互写法。"),
+  );
 }
 
 export function exitOnCancel(value: unknown): asserts value is string {
@@ -292,11 +309,24 @@ export async function promptProfileDraft(
     apiKey: string;
     model: string;
     models: string[];
+    /** Lightweight model; null skips the prompt without setting one. */
+    smallModel: string | null;
     proxy: string;
     preset: string;
     bridgeMode: "chat" | "completions";
   }> = {},
 ): Promise<Profile> {
+  // 只有在还缺必填项时才需要 TTY；参数齐全的调用（provider add --base-url …）可非交互完成。
+  if (
+    partial.baseUrl === undefined ||
+    partial.apiKey === undefined ||
+    partial.preset === undefined
+  ) {
+    requireInteractive(
+      "添加供应商",
+      `请改用：llms ${tool} provider add --preset custom --base-url <url> --api-key <key> --model <id>。`,
+    );
+  }
   p.intro(`为 ${tool} 添加供应商配置`);
 
   const presets = presetsForTool(tool);
@@ -448,6 +478,10 @@ export async function promptProfileDraft(
         apiFormat = "openai-chat";
         bridgeMode = undefined;
       } else {
+        requireInteractive(
+          "手动选择接口格式",
+          `自动探测失败，请改用 --format <${supportedFormats(tool).join("|")}> 明确指定。`,
+        );
         const upstream = await promptOpenAiCompatibleUpstream(tool, {
           apiFormat: "openai-chat",
           bridgeMode: "chat",
@@ -486,6 +520,8 @@ export async function promptProfileDraft(
     presetModels: preset.models,
     fixedDefault: partial.model,
     fixedList: partial.models,
+    supportsSmall: supportsSmallModel(tool),
+    fixedSmall: partial.smallModel,
   });
   const { defaultModel, modelList } = resolved;
   if (resolved.resolvedBaseUrl && resolved.resolvedBaseUrl !== baseUrl) {
@@ -503,6 +539,7 @@ export async function promptProfileDraft(
     apiKey: apiKey || "",
     models: {
       default: defaultModel,
+      smallModel: resolved.smallModel,
       list: Array.from(new Set(modelList)),
       meta: resolved.modelMeta,
     },
@@ -617,16 +654,27 @@ export type ResolveModelsInput = {
   /** Prefill for interactive selection (model / use 新建时) */
   preferredDefault?: string;
   preferredList?: string[];
+  /** Whether the target tool has a small-model knob (see supportsSmallModel). */
+  supportsSmall?: boolean;
+  /** Prefill for the small model selection. */
+  preferredSmall?: string;
+  /** Non-interactive: string → use it, null → clear, undefined → prompt. */
+  fixedSmall?: string | null;
 };
 
 export type ResolveModelsResult = {
   defaultModel: string;
   modelList: string[];
+  /** Small model for cheap tasks; undefined when not configured. */
+  smallModel?: string;
   /** When /models succeeded on a different prefix (e.g. added /v1). */
   resolvedBaseUrl?: string;
   /** Metadata (modalities/attachment) per model id from models.lonae.com. */
   modelMeta?: Record<string, ModelMeta>;
 };
+
+const NO_SMALL_MODEL = "__none__";
+const MANUAL_MODEL = "__manual__";
 
 /**
  * Fetch models from the provider API (when possible), then let the user
@@ -643,11 +691,11 @@ export async function resolveModelsInteractive(
   if (input.fixedDefault && input.fixedList?.length) {
     const list = [...input.fixedList];
     if (!list.includes(input.fixedDefault)) list.unshift(input.fixedDefault);
-    return {
-      defaultModel: input.fixedDefault,
-      modelList: list,
-      modelMeta: collectModelMeta(await metaPromise, list),
-    };
+    return withSmallModel(
+      { defaultModel: input.fixedDefault, modelList: list },
+      fixedSmallFor(input),
+      await metaPromise,
+    );
   }
 
   if (input.fixedDefault && !input.fixedList) {
@@ -655,23 +703,112 @@ export async function resolveModelsInteractive(
     const list = fetched?.models.length
       ? Array.from(new Set([input.fixedDefault, ...fetched.models]))
       : [input.fixedDefault];
-    return {
-      defaultModel: input.fixedDefault,
-      modelList: list,
-      resolvedBaseUrl: fetched?.resolvedBaseUrl,
-      modelMeta: collectModelMeta(await metaPromise, list),
-    };
+    return withSmallModel(
+      {
+        defaultModel: input.fixedDefault,
+        modelList: list,
+        resolvedBaseUrl: fetched?.resolvedBaseUrl,
+      },
+      fixedSmallFor(input),
+      await metaPromise,
+    );
   }
 
   const catalog = await metaPromise;
   const fetched = await tryFetchModels(input);
 
-  if (fetched && fetched.models.length > 0) {
-    const selected = await selectModelsFromFetched(fetched.models, input, catalog);
-    return { ...selected, resolvedBaseUrl: fetched.resolvedBaseUrl };
-  }
+  const selected =
+    fetched && fetched.models.length > 0
+      ? await selectModelsFromFetched(fetched.models, input, catalog)
+      : await manualModelsEntry(input, catalog);
 
-  return manualModelsEntry(input, catalog);
+  const smallModel =
+    input.supportsSmall && input.fixedSmall === undefined
+      ? await promptSmallModel(input, selected, catalog)
+      : fixedSmallFor(input);
+
+  return withSmallModel(
+    { ...selected, resolvedBaseUrl: fetched?.resolvedBaseUrl },
+    smallModel,
+    catalog,
+  );
+}
+
+/** Honor an explicit --small flag; ignored for tools without the capability. */
+function fixedSmallFor(input: ResolveModelsInput): string | undefined {
+  if (!input.supportsSmall) return undefined;
+  return input.fixedSmall?.trim() || undefined;
+}
+
+/**
+ * Fold the lightweight model into the result: it must be part of the saved
+ * model list so adapters can declare it (OpenCode needs every referenced model
+ * defined inside the provider block).
+ */
+function withSmallModel(
+  base: Omit<ResolveModelsResult, "smallModel">,
+  smallModel: string | undefined,
+  catalog: ModelMetadataCatalog | undefined,
+): ResolveModelsResult {
+  const modelList =
+    smallModel && !base.modelList.includes(smallModel)
+      ? [...base.modelList, smallModel]
+      : base.modelList;
+  return {
+    ...base,
+    modelList,
+    smallModel,
+    modelMeta: collectModelMeta(catalog, modelList),
+  };
+}
+
+/**
+ * Optional step: pick a cheaper model for lightweight tasks (title generation,
+ * summaries). Only asked for tools that can act on it.
+ */
+async function promptSmallModel(
+  input: ResolveModelsInput,
+  selected: { defaultModel: string; modelList: string[] },
+  catalog: ModelMetadataCatalog | undefined,
+): Promise<string | undefined> {
+  const candidates = selected.modelList.filter(
+    (id) => id !== selected.defaultModel,
+  );
+  const preferred =
+    input.preferredSmall && candidates.includes(input.preferredSmall)
+      ? input.preferredSmall
+      : undefined;
+
+  const picked = await p.select({
+    message: "选择轻量小模型（用于标题生成等低成本任务）",
+    options: [
+      {
+        value: NO_SMALL_MODEL,
+        label: "不设置",
+        hint: `沿用默认模型 ${selected.defaultModel}`,
+      },
+      ...candidates.map((id) => ({
+        value: id,
+        label: id,
+        hint: joinHints(
+          id === input.preferredSmall ? "当前" : undefined,
+          metadataHint(id, catalog),
+        ),
+      })),
+      { value: MANUAL_MODEL, label: "手动输入模型 ID" },
+    ],
+    initialValue: preferred ?? NO_SMALL_MODEL,
+  });
+  exitOnCancel(picked);
+
+  if (picked === NO_SMALL_MODEL) return undefined;
+  if (picked !== MANUAL_MODEL) return picked;
+
+  const manual = await promptText({
+    message: "小模型 ID（留空表示不设置）",
+    initialValue: input.preferredSmall || "",
+  });
+  return manual.trim() || undefined;
 }
 
 /**
