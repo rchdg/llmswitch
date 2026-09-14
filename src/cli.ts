@@ -18,7 +18,10 @@ export function createProgram(): Command {
       "为 Claude Code / Codex / OpenCode 切换供应商、模型与上游代理",
     )
     .version(getVersion())
-    .option("--json", "部分命令支持 JSON 输出（见子命令）");
+    // 注意：不要在根命令上声明 --json。commander 会把它当作根命令的选项，
+    // 从而吞掉所有子命令自己的 --json（子命令 opts.json 恒为 undefined）。
+    // JSON 输出一律由各子命令自行声明。
+    .showSuggestionAfterError();
 
   program
     .command("path")
@@ -56,13 +59,23 @@ export async function run(argv = process.argv): Promise<void> {
   try {
     await program.parseAsync(argv);
   } catch (err) {
+    const code =
+      err && typeof err === "object" && "code" in err
+        ? String((err as { code?: unknown }).code)
+        : "";
     if (
-      err &&
-      typeof err === "object" &&
-      "code" in err &&
-      (err.code === "commander.helpDisplayed" ||
-        err.code === "commander.version")
+      code === "commander.helpDisplayed" ||
+      code === "commander.help" ||
+      code === "commander.version"
     ) {
+      return;
+    }
+    // commander 已经把用法错误写到 stderr 了，不要再加「错误：」重复打印一遍。
+    if (code.startsWith("commander.")) {
+      process.exitCode =
+        typeof (err as { exitCode?: unknown }).exitCode === "number"
+          ? (err as { exitCode: number }).exitCode
+          : 1;
       return;
     }
     const message = err instanceof Error ? err.message : String(err);
