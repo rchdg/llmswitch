@@ -105,18 +105,34 @@ export function upstreamFromProfile(
   };
 }
 
-/** Resolve a profile's failover chain into upstream candidates. */
+/**
+ * 展开后的候选总数上限。备用本身还能再挂备用，没有上限时一个
+ * 3×3×3 的嵌套配置会变成 39 次重试。
+ */
+const MAX_FALLBACK_CANDIDATES = 6;
+
+/**
+ * Resolve a profile's failover chain into a flat candidate list.
+ *
+ * Backups may declare their own fallbacks; the graph is expanded breadth-first
+ * (all direct backups first, then their backups) with cycles and duplicates
+ * dropped, so `A → B → C` plus `B → D` yields `B, C, D`.
+ */
 export function resolveFallbackUpstreams(
   profile: Profile,
   tool: BridgeTool,
 ): BridgeUpstream[] | undefined {
-  const names = (profile.fallbacks ?? []).filter(
-    (name, index) =>
-      name !== profile.name && profile.fallbacks?.indexOf(name) === index,
+  const queue = (profile.fallbacks ?? []).filter(
+    (name) => name !== profile.name,
   );
-  if (names.length === 0) return undefined;
+  if (queue.length === 0) return undefined;
+  // 主供应商已在链上：备用再指回主时直接跳过，避免环。
+  const visited = new Set<string>([profile.name]);
   const candidates: BridgeUpstream[] = [];
-  for (const name of names) {
+  while (queue.length > 0 && candidates.length < MAX_FALLBACK_CANDIDATES) {
+    const name = queue.shift()!;
+    if (visited.has(name)) continue;
+    visited.add(name);
     const fallbackProfile = readProfile(tool, name);
     if (!fallbackProfile) {
       console.warn(
@@ -124,14 +140,19 @@ export function resolveFallbackUpstreams(
       );
       continue;
     }
-    // 候选不再嵌套自己的 fallbacks（只支持一层链）。
-    const { fallbacks: _ignored, ...upstream } = upstreamFromProfile(
-      fallbackProfile,
-      tool,
-      null,
-    );
+    const upstream = upstreamFromProfile(fallbackProfile, tool, null);
     upstream.clientToken = null;
     candidates.push(upstream);
+    for (const nested of fallbackProfile.fallbacks ?? []) {
+      if (nested !== fallbackProfile.name && !visited.has(nested)) {
+        queue.push(nested);
+      }
+    }
+  }
+  if (queue.some((name) => !visited.has(name))) {
+    console.warn(
+      `注意：备用链候选超过 ${MAX_FALLBACK_CANDIDATES} 个，已截断（llms ${tool} fallback list 查看）`,
+    );
   }
   return candidates.length > 0 ? candidates : undefined;
 }

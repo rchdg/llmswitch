@@ -473,15 +473,7 @@ async function handleResponses(
   }
 
   markBridgeModel(res, String(body.model || ""));
-  const mode = upstream.mode || "chat";
-  const wantStream = Boolean(body.stream);
-
-  if (mode === "completions") {
-    await forwardCompletions(req, res, upstream, body, wantStream, signal);
-    return;
-  }
-
-  await forwardChatResponses(req, res, upstream, body, wantStream, signal);
+  await forwardResponses(req, res, upstream, body, Boolean(body.stream), signal);
 }
 
 async function handleMessages(
@@ -625,7 +617,94 @@ function finishAnthropicError(
   });
 }
 
-async function forwardChatResponses(
+type ResponsesProtocol = "chat" | "completions";
+
+interface ResponsesAttempt {
+  url: string;
+  payload: string;
+  inputEstimate?: number;
+}
+
+/** 候选的协议跟随自身配置（profile.bridgeMode），而不是主上游。 */
+function candidateProtocol(candidate: BridgeUpstream): ResponsesProtocol {
+  return candidate.mode === "completions" ? "completions" : "chat";
+}
+
+function buildResponsesAttempt(
+  body: Record<string, unknown>,
+  candidate: BridgeUpstream,
+  protocol: ResponsesProtocol,
+): ResponsesAttempt {
+  if (protocol === "completions") {
+    return {
+      url: joinUrl(candidate.baseUrl, "/completions"),
+      payload: JSON.stringify(
+        responsesToCompletionsRequest(body, shapingFor(candidate)),
+      ),
+    };
+  }
+  const chatReq = responsesToChatRequest(body, shapingFor(candidate));
+  return {
+    url: joinUrl(candidate.baseUrl, "/chat/completions"),
+    payload: JSON.stringify(chatReq),
+    inputEstimate: estimateChatInputTokens(chatReq.messages),
+  };
+}
+
+/**
+ * 候选先按自己声明的协议请求。端点返回 404/405 说明协议配置不准（典型是
+ * completions-only 上游被当成 chat），换另一协议在同一候选上重试一次，不消耗
+ * 备用名额、不插入 failover 提示。连接错误与协议无关，直接交给上层 failover。
+ */
+async function requestResponsesCandidate(
+  req: IncomingMessage,
+  candidate: BridgeUpstream,
+  body: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<
+  | { response: NodeTransportResponse; attempt: ResponsesAttempt }
+  | { error: string }
+> {
+  const order: ResponsesProtocol[] =
+    candidateProtocol(candidate) === "completions"
+      ? ["completions", "chat"]
+      : ["chat", "completions"];
+  let lastError = "";
+  for (let index = 0; index < order.length; index += 1) {
+    const attempt = buildResponsesAttempt(body, candidate, order[index]!);
+    let response: NodeTransportResponse;
+    try {
+      response = await requestUpstream(
+        candidate,
+        attempt.url,
+        "POST",
+        attempt.payload,
+        signal,
+        sessionHeadersFor(req, candidate, attempt.payload),
+      );
+    } catch (err) {
+      lastError = upstreamErrorMessage(err);
+      break;
+    }
+    const isLastProtocol = index === order.length - 1;
+    if (
+      !response.ok &&
+      (response.status === 404 || response.status === 405) &&
+      !isLastProtocol
+    ) {
+      console.log(
+        `[llm-switch bridge] ${candidateLabel(candidate)} ${attempt.url} 返回 HTTP ${response.status}，改用另一协议重试`,
+      );
+      // 丢弃探测响应体，避免占着 keep-alive 连接。
+      await response.text().catch(() => "");
+      continue;
+    }
+    return { response, attempt };
+  }
+  return { error: lastError };
+}
+
+async function forwardResponses(
   req: IncomingMessage,
   res: ServerResponse,
   upstream: BridgeUpstream,
@@ -644,24 +723,16 @@ async function forwardChatResponses(
     const candidate = candidates[index];
     const isLast = index === candidates.length - 1;
     const effectiveBody = withCandidateModel(body, candidate);
-    const chatReq = responsesToChatRequest(effectiveBody, shapingFor(candidate));
-    const inputEstimate = estimateChatInputTokens(chatReq.messages);
-    const chatBody = JSON.stringify(chatReq);
-    const url = joinUrl(candidate.baseUrl, "/chat/completions");
     markBridgeModel(res, String(effectiveBody.model || ""));
 
-    let response: NodeTransportResponse;
-    try {
-      response = await requestUpstream(
-        candidate,
-        url,
-        "POST",
-        chatBody,
-        signal,
-        sessionHeadersFor(req, candidate, chatBody),
-      );
-    } catch (err) {
-      const message = `Upstream chat 请求失败: ${upstreamErrorMessage(err)}`;
+    const outcome = await requestResponsesCandidate(
+      req,
+      candidate,
+      effectiveBody,
+      signal,
+    );
+    if ("error" in outcome) {
+      const message = `Upstream 请求失败: ${outcome.error}`;
       markBridgeError(res, message);
       if (isLast) {
         finishResponsesError(
@@ -679,21 +750,9 @@ async function forwardChatResponses(
       continue;
     }
 
+    const { response, attempt } = outcome;
     if (!response.ok) {
       const text = await response.text();
-      if (response.status === 404 || response.status === 405) {
-        // SSE 头已发出、keepalive 已在跑：原样交给 completions 降级路径。
-        await forwardCompletions(
-          req,
-          res,
-          candidate,
-          effectiveBody,
-          wantStream,
-          signal,
-          keepalive,
-        );
-        return;
-      }
       const summary = `HTTP ${response.status}: ${text.slice(0, 300)}`;
       markBridgeError(res, summary);
       if (FAILOVER_STATUSES.has(response.status) && !isLast) {
@@ -726,7 +785,7 @@ async function forwardChatResponses(
           String(effectiveBody.model || ""),
           customTools,
           true,
-          inputEstimate,
+          attempt.inputEstimate,
         ),
       );
       return;
@@ -738,7 +797,7 @@ async function forwardChatResponses(
       customTools,
       true,
       keepalive,
-      inputEstimate,
+      attempt.inputEstimate,
     );
     return;
   }
@@ -888,124 +947,6 @@ async function forwardOpenCodeChat(
     await pipeRawStream(response, res);
     return;
   }
-}
-
-async function forwardCompletions(
-  req: IncomingMessage,
-  res: ServerResponse,
-  upstream: BridgeUpstream,
-  body: Record<string, unknown>,
-  wantStream: boolean,
-  signal?: AbortSignal,
-  existingKeepalive?: SseKeepalive,
-): Promise<void> {
-  const customTools = collectCustomToolNames(body.tools);
-  const candidates = upstreamCandidates(upstream);
-  let keepalive = existingKeepalive;
-  const failures: string[] = [];
-
-  for (let index = 0; index < candidates.length; index += 1) {
-    const candidate = candidates[index];
-    const isLast = index === candidates.length - 1;
-    const effectiveBody = withCandidateModel(body, candidate);
-    const completionReq = responsesToCompletionsRequest(
-      effectiveBody,
-      shapingFor(candidate),
-    );
-    const completionBody = JSON.stringify(completionReq);
-    const url = joinUrl(candidate.baseUrl, "/completions");
-    markBridgeModel(res, String(effectiveBody.model || ""));
-
-    if (wantStream && !res.headersSent) {
-      keepalive = startSse(res);
-    }
-
-    let response: NodeTransportResponse;
-    try {
-      response = await requestUpstream(
-        candidate,
-        url,
-        "POST",
-        completionBody,
-        signal,
-        sessionHeadersFor(req, candidate, completionBody),
-      );
-    } catch (err) {
-      const message = `Upstream completions 请求失败: ${upstreamErrorMessage(err)}`;
-      markBridgeError(res, message);
-      if (isLast) {
-        finishResponsesError(
-          res,
-          keepalive,
-          failures,
-          candidateLabel(candidate),
-          message,
-          failures.length > 0,
-        );
-        return;
-      }
-      failures.push(`${candidateLabel(candidate)}: ${message}`);
-      announceFailover(res, keepalive, candidate, candidates[index + 1]!);
-      continue;
-    }
-
-    if (!response.ok) {
-      const text = await response.text();
-      const summary = `HTTP ${response.status}: ${text.slice(0, 300)}`;
-      markBridgeError(res, summary);
-      if (FAILOVER_STATUSES.has(response.status) && !isLast) {
-        failures.push(`${candidateLabel(candidate)}: ${summary}`);
-        announceFailover(res, keepalive, candidate, candidates[index + 1]!);
-        continue;
-      }
-      keepalive?.stop();
-      if (keepalive) {
-        emitResponsesFailure(res, summary);
-        res.end();
-        return;
-      }
-      res.writeHead(response.status, {
-        "Content-Type":
-          response.headers.get("content-type") || "application/json",
-      });
-      res.end(text);
-      return;
-    }
-
-    markBridgeUpstream(res, candidateLabel(candidate));
-    if (!wantStream) {
-      const json = (await response.json()) as Record<string, unknown>;
-      sendJson(
-        res,
-        200,
-        chatCompletionToResponse(
-          json,
-          String(effectiveBody.model || ""),
-          customTools,
-          true,
-        ),
-      );
-      return;
-    }
-    await pipeChatStreamToResponses(
-      response,
-      res,
-      String(effectiveBody.model || ""),
-      customTools,
-      true,
-      keepalive,
-    );
-    return;
-  }
-
-  finishResponsesError(
-    res,
-    keepalive,
-    failures,
-    candidateLabel(upstream),
-    "所有上游均失败",
-    true,
-  );
 }
 
 async function pipeChatStreamToResponses(

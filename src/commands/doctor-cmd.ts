@@ -513,7 +513,21 @@ function checkFallbacks(
       detail: `未配置备用供应商（llms ${tool} fallback add <name> 可添加）`,
     };
   }
-  const missing = chain.filter((name) => !readProfile(tool, name));
+  // 备用可以再挂备用：整张图里的缺失都要报出来，而不只是第一层。
+  const missing: string[] = [];
+  const visited = new Set<string>([profile.name]);
+  const queue = [...chain];
+  while (queue.length > 0) {
+    const name = queue.shift()!;
+    if (visited.has(name)) continue;
+    visited.add(name);
+    const fallbackProfile = readProfile(tool, name);
+    if (!fallbackProfile) {
+      missing.push(name);
+      continue;
+    }
+    queue.push(...(fallbackProfile.fallbacks ?? []));
+  }
   if (missing.length > 0) {
     return {
       name: "故障转移备用链",

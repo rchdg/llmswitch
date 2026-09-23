@@ -456,7 +456,13 @@ out, the Bridge retries the same request along the fallback chain. Failover
 happens before the streaming response starts, so clients never notice (a
 `: failover: primary → backup` comment frame is injected into the SSE stream
 for troubleshooting). Each fallback forwards to its own default model (the
-model id in the request is rewritten) and uses its own credentials.
+model id in the request is rewritten), speaks its own protocol (chat /
+completions) on the matching endpoint, and uses its own credentials.
+
+Backups may declare their own fallbacks: the graph is expanded breadth-first
+(direct backups first, their backups after), deduplicated, cycles (a backup
+pointing back at the primary) are dropped, and the flattened chain is capped
+at 6 candidates.
 
 ```bash
 # Specify the chain when enabling (up to 3)

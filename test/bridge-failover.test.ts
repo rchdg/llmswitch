@@ -54,14 +54,16 @@ async function waitFor(
 
 interface MockUpstream {
   port: number;
-  requests: Array<{ model: string; stream: boolean }>;
+  requests: Array<{ path: string; model: string; stream: boolean }>;
   /** Response behaviour per request. */
   status?: number;
   ok?: boolean;
 }
 
 /** Chat upstream mock: replies SSE or JSON, records what it received. */
-function startMock(options: { status?: number; ok?: boolean } = {}): Promise<MockUpstream> {
+function startMock(
+  options: { status?: number; ok?: boolean; only?: "chat" | "completions" } = {},
+): Promise<MockUpstream> {
   const mock: MockUpstream = { port: 0, requests: [], ...options };
   const server = createServer((req, res) => {
     let body = "";
@@ -70,7 +72,26 @@ function startMock(options: { status?: number; ok?: boolean } = {}): Promise<Moc
     });
     req.on("end", () => {
       const parsed = JSON.parse(body) as { model?: string; stream?: boolean };
-      mock.requests.push({ model: parsed.model ?? "", stream: Boolean(parsed.stream) });
+      const path = req.url ?? "";
+      const isCompletions = path.endsWith("/completions") && !path.endsWith("/chat/completions");
+      mock.requests.push({
+        path,
+        model: parsed.model ?? "",
+        stream: Boolean(parsed.stream),
+      });
+      if (
+        options.only === "completions" &&
+        path.endsWith("/chat/completions")
+      ) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "no chat endpoint" } }));
+        return;
+      }
+      if (options.only === "chat" && isCompletions) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "no completions endpoint" } }));
+        return;
+      }
       if (options.status && options.status !== 200) {
         res.writeHead(options.status, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: { message: `mock ${options.status}` } }));
@@ -79,9 +100,11 @@ function startMock(options: { status?: number; ok?: boolean } = {}): Promise<Moc
       if (parsed.stream) {
         res.writeHead(200, { "Content-Type": "text/event-stream" });
         res.write(
-          `data: ${JSON.stringify({
-            choices: [{ delta: { content: "from-mock" }, finish_reason: null }],
-          })}\n\n`,
+          `data: ${JSON.stringify(
+            isCompletions
+              ? { choices: [{ text: "from-mock", index: 0, finish_reason: null }] }
+              : { choices: [{ delta: { content: "from-mock" }, finish_reason: null }] },
+          )}\n\n`,
         );
         res.write("data: [DONE]\n\n");
         res.end();
@@ -89,12 +112,22 @@ function startMock(options: { status?: number; ok?: boolean } = {}): Promise<Moc
       }
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
-        JSON.stringify({
-          model: parsed.model,
-          choices: [
-            { message: { role: "assistant", content: "from-mock" }, finish_reason: "stop" },
-          ],
-        }),
+        JSON.stringify(
+          isCompletions
+            ? {
+                model: parsed.model,
+                object: "text_completion",
+                choices: [
+                  { text: "from-mock", index: 0, finish_reason: "stop" },
+                ],
+              }
+            : {
+                model: parsed.model,
+                choices: [
+                  { message: { role: "assistant", content: "from-mock" }, finish_reason: "stop" },
+                ],
+              },
+        ),
       );
     });
   });
@@ -195,8 +228,51 @@ describe("fallback chain resolution", () => {
     expect(upstreams![0]!.profileName).toBe("b1");
     expect(upstreams![0]!.model).toBe("b1-model");
     expect(upstreams![0]!.clientToken).toBeNull();
-    // Nested chains are not supported: fallback-of-fallback is ignored.
-    expect(upstreams![0]!.fallbacks).toBeUndefined();
+  });
+
+  test("resolveFallbackUpstreams expands nested chains breadth-first, deduped", () => {
+    saveProfile("codex", profileOf("main", { fallbacks: ["b1", "b2"] }));
+    saveProfile("codex", profileOf("b1", { fallbacks: ["b2", "c1"] }));
+    saveProfile("codex", profileOf("b2", { fallbacks: ["main", "c1"] }));
+    saveProfile("codex", profileOf("c1", { fallbacks: ["c2"] }));
+    saveProfile("codex", profileOf("c2"));
+
+    const main = profileOf("main", { fallbacks: ["b1", "b2"] });
+    const upstreams = resolveFallbackUpstreams(main, "codex");
+    // Direct backups first, then their own backups; cycles/duplicates dropped.
+    expect(upstreams!.map((upstream) => upstream.profileName)).toEqual([
+      "b1",
+      "b2",
+      "c1",
+      "c2",
+    ]);
+    // The flattened list never nests fallbacks again.
+    expect(upstreams!.every((upstream) => upstream.fallbacks === undefined)).toBe(
+      true,
+    );
+  });
+
+  test("resolveFallbackUpstreams caps the expanded chain length", () => {
+    saveProfile("codex", profileOf("main", { fallbacks: ["b1"] }));
+    saveProfile("codex", profileOf("b1", { fallbacks: ["b2"] }));
+    saveProfile("codex", profileOf("b2", { fallbacks: ["b3"] }));
+    saveProfile("codex", profileOf("b3", { fallbacks: ["b4"] }));
+    saveProfile("codex", profileOf("b4", { fallbacks: ["b5"] }));
+    saveProfile("codex", profileOf("b5", { fallbacks: ["b6"] }));
+    saveProfile("codex", profileOf("b6", { fallbacks: ["b7"] }));
+    saveProfile("codex", profileOf("b7"));
+
+    const main = profileOf("main", { fallbacks: ["b1"] });
+    const upstreams = resolveFallbackUpstreams(main, "codex");
+    expect(upstreams!.length).toBe(6);
+    expect(upstreams!.map((upstream) => upstream.profileName)).toEqual([
+      "b1",
+      "b2",
+      "b3",
+      "b4",
+      "b5",
+      "b6",
+    ]);
   });
 
   test("resolveFallbackUpstreams returns undefined without valid names", () => {
@@ -234,7 +310,9 @@ describe("bridge failover", () => {
     expect(completed).toBeDefined();
 
     // Fallback received the rewritten model id.
-    expect(backupMock.requests).toEqual([{ model: "backup-model", stream: true }]);
+    expect(backupMock.requests).toEqual([
+      { path: "/v1/chat/completions", model: "backup-model", stream: true },
+    ]);
     expect(primaryMock.requests.length).toBe(1);
 
     const logs = await recentLogs(port);
@@ -300,6 +378,74 @@ describe("bridge failover", () => {
     const text = await response.text();
     expect(text).toContain("a");
     expect(second.requests.length).toBe(1);
+    await stopBridge();
+  });
+
+  test("fallback keeps its own protocol: completions-only backup gets /completions", async () => {
+    const primaryMock = await startMock({ status: 500 });
+    const backupMock = await startMock({ only: "completions" });
+    const token = generateBridgeToken();
+    const { port } = await startBridgeWith({
+      ...candidateFrom(primaryMock, "primary", "primary-model"),
+      clientToken: token,
+      fallbacks: [
+        {
+          ...candidateFrom(backupMock, "backup", "backup-model"),
+          mode: "completions",
+        },
+      ],
+    });
+
+    const response = await post(port, token, { model: "primary-model", input: "hi", stream: true });
+    expect(response.status).toBe(200);
+    const text = await response.text();
+    expect(text).toContain(": llm-switch failover: primary → backup");
+    expect(text).toContain("from-mock");
+    // Direct hit on /completions: no wasted /chat/completions round trip.
+    expect(backupMock.requests).toEqual([
+      { path: "/v1/completions", model: "backup-model", stream: true },
+    ]);
+    await stopBridge();
+  });
+
+  test("primary protocol does not leak onto backups (completions → chat)", async () => {
+    const primaryMock = await startMock({ status: 500, only: "completions" });
+    const backupMock = await startMock();
+    const token = generateBridgeToken();
+    const { port } = await startBridgeWith({
+      ...candidateFrom(primaryMock, "primary", "primary-model"),
+      mode: "completions",
+      clientToken: token,
+      fallbacks: [candidateFrom(backupMock, "backup", "backup-model")],
+    });
+
+    const response = await post(port, token, { model: "primary-model", input: "hi" });
+    expect(response.status).toBe(200);
+    const json = (await response.json()) as { output?: unknown };
+    expect(json.output).toBeDefined();
+    expect(primaryMock.requests[0]?.path).toBe("/v1/completions");
+    expect(backupMock.requests).toEqual([
+      { path: "/v1/chat/completions", model: "backup-model", stream: false },
+    ]);
+    await stopBridge();
+  });
+
+  test("wrong protocol guess is corrected on 404 without burning a failover", async () => {
+    const mock = await startMock({ only: "completions" });
+    const token = generateBridgeToken();
+    const { port } = await startBridgeWith({
+      ...candidateFrom(mock, "solo", "solo-model"),
+      clientToken: token,
+    });
+
+    const response = await post(port, token, { model: "solo-model", input: "hi" });
+    expect(response.status).toBe(200);
+    const json = (await response.json()) as { output?: unknown };
+    expect(json.output).toBeDefined();
+    expect(mock.requests.map((request) => request.path)).toEqual([
+      "/v1/chat/completions",
+      "/v1/completions",
+    ]);
     await stopBridge();
   });
 });
