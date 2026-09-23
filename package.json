@@ -1,6 +1,6 @@
 {
   "name": "@nvae/llmswitch",
-  "version": "1.9.0",
+  "version": "1.10.0",
   "description": "CLI to switch LLM providers and models for Claude Code, Codex, and OpenCode",
   "type": "module",
   "bin": {
