@@ -71,6 +71,8 @@ llms opencode provider
 
 自定义上游时，工具会自动探测接口类型（Anthropic / OpenAI Chat / OpenAI Responses），无需手动选择；仅当自动识别失败时才需要手动指定。支持本地 Ollama（`/v1` 兼容或原生 `/api/tags`，无需 API Key），预设中也有「Ollama（本地）」可选。
 
+预设中还有「OpenCode Go」，一键预填 Zen Go 的端点 `https://opencode.ai/zen/go/v1` 与常用模型，走 Chat Completions。注意 Zen Go 按模型分流协议：Grok / GPT / Muse Spark 走 `/v1/responses`，MiniMax / Qwen 走 `/v1/messages`，这两类模型需另建对应格式的供应商。
+
 Profile 名称会自动生成（5 位随机小写字母数字，如 `69pjb`），所有命令都可通过名称或显示名称引用供应商：
 
 ```bash

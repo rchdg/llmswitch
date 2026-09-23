@@ -1,6 +1,6 @@
 {
   "name": "@nvae/llmswitch",
-  "version": "1.2.0",
+  "version": "1.4.0",
   "description": "CLI to switch LLM providers and models for Claude Code, Codex, and OpenCode",
   "type": "module",
   "bin": {
@@ -23,7 +23,8 @@
     "lint:fix": "biome lint --write src test scripts",
     "format": "biome format --write src test scripts",
     "verify": "bun run typecheck && bun run lint && bun test",
-    "prepublishOnly": "bun run typecheck && bun run lint && bun run build"
+    "version:bump": "node scripts/bump-version.mjs",
+    "prepublishOnly": "bun run typecheck && bun run lint && bun run build && bun run version:bump"
   },
   "engines": {
     "node": ">=20"

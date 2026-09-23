@@ -70,6 +70,8 @@ Follow the prompts to enter: API URL, API Key, display name.
 
 For custom upstreams, the API type (Anthropic / OpenAI Chat / OpenAI Responses) is auto-detected by probing the endpoint — no manual selection needed. Manual selection only appears when detection fails. Local Ollama is supported too (`/v1` compatible or native `/api/tags`, no API key required), and an "Ollama (local)" preset is available.
 
+An "OpenCode Go" preset is also available: it prefills the Zen Go endpoint `https://opencode.ai/zen/go/v1` plus the common models, over Chat Completions. Note that Zen Go splits protocols per model: Grok / GPT / Muse Spark use `/v1/responses`, and MiniMax / Qwen use `/v1/messages` — those need a separate profile with the matching format.
+
 Profile names are auto-generated (5 random lowercase letters/digits, e.g. `69pjb`). Every command accepts either the name or the display name to reference a provider:
 
 ```bash
