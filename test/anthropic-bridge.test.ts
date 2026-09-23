@@ -69,6 +69,98 @@ describe("anthropic → chat request", () => {
       content: "12:00",
     });
   });
+
+  test("maps image and document blocks to chat multimodal parts", () => {
+    const chat = anthropicToChatRequest({
+      model: "m",
+      max_tokens: 64,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "看这些" },
+            {
+              type: "image",
+              source: { type: "base64", media_type: "image/png", data: "AAAA" },
+            },
+            {
+              type: "document",
+              title: "doc.pdf",
+              source: {
+                type: "base64",
+                media_type: "application/pdf",
+                data: "JVBERi0=",
+              },
+            },
+            {
+              type: "image",
+              source: { type: "url", url: "https://x.test/a.png" },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(chat.messages[0]?.content).toEqual([
+      { type: "text", text: "看这些" },
+      {
+        type: "image_url",
+        image_url: { url: "data:image/png;base64,AAAA" },
+      },
+      {
+        type: "file",
+        file: {
+          filename: "doc.pdf",
+          file_data: "data:application/pdf;base64,JVBERi0=",
+        },
+      },
+      { type: "image_url", image_url: { url: "https://x.test/a.png" } },
+    ]);
+  });
+
+  test("moves tool_result images into a follow-up user message", () => {
+    // Claude Code 的 Read 工具读截图时，图片在 tool_result 里；Chat 的
+    // tool 消息只接受字符串内容，附件必须挪到紧随其后的 user 消息。
+    const chat = anthropicToChatRequest({
+      model: "m",
+      max_tokens: 64,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_1",
+              content: [
+                { type: "text", text: "截图如下" },
+                {
+                  type: "image",
+                  source: {
+                    type: "base64",
+                    media_type: "image/png",
+                    data: "AAAA",
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(chat.messages[0]).toEqual({
+      role: "tool",
+      tool_call_id: "toolu_1",
+      content: "截图如下",
+    });
+    expect(chat.messages[1]?.role).toBe("user");
+    expect(chat.messages[1]?.content).toEqual([
+      {
+        type: "image_url",
+        image_url: { url: "data:image/png;base64,AAAA" },
+      },
+    ]);
+  });
 });
 
 describe("chat → anthropic response", () => {

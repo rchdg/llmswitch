@@ -180,6 +180,40 @@ describe("chat → anthropic request", () => {
     });
   });
 
+  test("converts chat file parts into anthropic document blocks", () => {
+    const body = chatToAnthropicRequest({
+      model: "claude-sonnet-4",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "总结" },
+            {
+              type: "file",
+              file: {
+                filename: "doc.pdf",
+                file_data: "data:application/pdf;base64,JVBERi0=",
+              },
+            },
+            { type: "file", file: { file_id: "file-abc" } },
+          ],
+        },
+      ],
+    });
+    const blocks = (body.messages as Array<{ content: Row[] }>)[0]!.content;
+    expect(blocks[1]).toEqual({
+      type: "document",
+      source: {
+        type: "base64",
+        media_type: "application/pdf",
+        data: "JVBERi0=",
+      },
+      title: "doc.pdf",
+    });
+    // file_id 引用没有 Anthropic 等价物，跳过而不是报错
+    expect(blocks).toHaveLength(2);
+  });
+
   test("round-trips back through the anthropic → chat translator", () => {
     const original = {
       model: "m",

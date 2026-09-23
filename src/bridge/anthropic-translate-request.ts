@@ -27,6 +27,66 @@ function extractTextBlocks(content: unknown): string {
   return parts.join("");
 }
 
+function toDataUrl(mediaType: string, base64: string): string {
+  return `data:${mediaType};base64,${base64}`;
+}
+
+/**
+ * Anthropic image/document 块 → Chat 多模态部分。
+ * base64 图文转 data URL；图片 URL 原样透传；纯文本文档包成 data URL。
+ * 返回 null 表示该块在 Chat 里没有等价形式（如 URL 引用的文档）。
+ */
+export function attachmentChatPart(
+  row: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const type = String(row.type || "");
+  if (type !== "image" && type !== "document") return null;
+  const source = asRecord(row.source);
+  if (!source) return null;
+  const sourceType = String(source.type || "");
+  const title =
+    typeof row.title === "string" && row.title ? row.title : undefined;
+
+  if (sourceType === "base64") {
+    const mediaType =
+      typeof source.media_type === "string" && source.media_type
+        ? source.media_type
+        : type === "image"
+          ? "image/png"
+          : "application/pdf";
+    const data = typeof source.data === "string" ? source.data : "";
+    if (!data) return null;
+    const url = toDataUrl(mediaType, data);
+    if (type === "image") {
+      return { type: "image_url", image_url: { url } };
+    }
+    const file: Record<string, unknown> = { file_data: url };
+    if (title) file.filename = title;
+    return { type: "file", file };
+  }
+
+  if (sourceType === "url" && type === "image") {
+    const url = typeof source.url === "string" ? source.url : "";
+    if (!url || !/^https?:\/\//i.test(url)) return null;
+    return { type: "image_url", image_url: { url } };
+  }
+
+  if (sourceType === "text" && type === "document") {
+    const text = typeof source.data === "string" ? source.data : "";
+    if (!text) return null;
+    const file: Record<string, unknown> = {
+      file_data: toDataUrl(
+        "text/plain",
+        Buffer.from(text, "utf8").toString("base64"),
+      ),
+    };
+    if (title) file.filename = title;
+    return { type: "file", file };
+  }
+
+  return null;
+}
+
 function systemToMessage(system: unknown): ChatMessage | null {
   if (typeof system === "string" && system.trim()) {
     return { role: "system", content: system };
@@ -89,14 +149,20 @@ function mapUserContent(content: unknown): ChatMessage[] {
     return [{ role: "user", content: "" }];
   }
 
+  // parts 按原顺序保留 text 与附件；无附件时回退为纯字符串 content。
+  const parts: Array<Record<string, unknown>> = [];
   const textParts: string[] = [];
   const toolResults: ChatMessage[] = [];
+  // tool_result 里的图片（如 Read 工具读截图）：Chat 的 tool 消息只接受
+  // 字符串内容，附件挪到紧随其后的 user 消息里。
+  const toolAttachments: Array<Record<string, unknown>> = [];
 
   for (const part of content) {
     const row = asRecord(part);
     if (!row) continue;
     if (row.type === "text" && typeof row.text === "string") {
       textParts.push(row.text);
+      parts.push({ type: "text", text: row.text });
       continue;
     }
     if (row.type === "tool_result") {
@@ -105,6 +171,12 @@ function mapUserContent(content: unknown): ChatMessage[] {
       if (typeof row.content === "string") resultContent = row.content;
       else if (Array.isArray(row.content)) {
         resultContent = extractTextBlocks(row.content);
+        for (const block of row.content) {
+          const b = asRecord(block);
+          if (!b) continue;
+          const attachment = attachmentChatPart(b);
+          if (attachment) toolAttachments.push(attachment);
+        }
       } else if (row.content != null) {
         try {
           resultContent = JSON.stringify(row.content);
@@ -117,14 +189,24 @@ function mapUserContent(content: unknown): ChatMessage[] {
         tool_call_id: toolCallId,
         content: resultContent,
       });
+      continue;
     }
+    const attachment = attachmentChatPart(row);
+    if (attachment) parts.push(attachment);
   }
 
+  const hasAttachment = parts.some((p) => p.type !== "text");
   const out: ChatMessage[] = [];
-  if (textParts.length) {
-    out.push({ role: "user", content: textParts.join("") });
+  if (parts.length) {
+    out.push({
+      role: "user",
+      content: hasAttachment ? parts : textParts.join(""),
+    });
   }
   out.push(...toolResults);
+  if (toolAttachments.length) {
+    out.push({ role: "user", content: toolAttachments });
+  }
   if (!out.length) out.push({ role: "user", content: "" });
   return out;
 }

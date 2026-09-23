@@ -156,6 +156,48 @@ describe("responsesToChatRequest", () => {
     ]);
   });
 
+  test("keeps input_file parts when translating to chat content", () => {
+    const fileData = "data:application/pdf;base64,JVBERi0xLjQ=";
+    const chat = responsesToChatRequest({
+      model: "m",
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: [
+            { type: "input_text", text: "总结这个文档" },
+            { type: "input_file", filename: "doc.pdf", file_data: fileData },
+          ],
+        },
+      ],
+    });
+
+    expect(chat.messages[0]?.content).toEqual([
+      { type: "text", text: "总结这个文档" },
+      {
+        type: "file",
+        file: { filename: "doc.pdf", file_data: fileData },
+      },
+    ]);
+  });
+
+  test("keeps input_file file_id references", () => {
+    const chat = responsesToChatRequest({
+      model: "m",
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_file", file_id: "file-abc123" }],
+        },
+      ],
+    });
+
+    expect(chat.messages[0]?.content).toEqual([
+      { type: "file", file: { file_id: "file-abc123" } },
+    ]);
+  });
+
   test("joins plain text messages into a string like before", () => {
     const chat = responsesToChatRequest({
       model: "m",

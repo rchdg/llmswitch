@@ -88,8 +88,9 @@ function mapRole(role: unknown): string {
 
 /**
  * Responses 消息内容 → Chat 消息内容。
- * 纯文本照旧合并为字符串；含 `input_image` 时输出多部分内容，把图片转成
- * Chat 的 `image_url` 块（data:/https: URL 原样透传），否则模型看不到附件图片。
+ * 纯文本照旧合并为字符串；含 `input_image`/`input_file` 时输出多部分内容，
+ * 分别转成 Chat 的 `image_url`（data:/https: URL 原样透传）与 `file` 块，
+ * 否则模型看不到附件。
  */
 function messageContent(
   content: unknown,
@@ -99,7 +100,7 @@ function messageContent(
 
   const parts: Array<Record<string, unknown>> = [];
   const texts: string[] = [];
-  let hasImage = false;
+  let hasAttachment = false;
   for (const part of content) {
     const row = asRecord(part);
     if (!row) continue;
@@ -121,17 +122,34 @@ function messageContent(
       typeof row.image_url === "string" &&
       row.image_url
     ) {
-      hasImage = true;
+      hasAttachment = true;
       const image: Record<string, unknown> = { url: row.image_url };
       if (typeof row.detail === "string" && row.detail) {
         image.detail = row.detail;
       }
       parts.push({ type: "image_url", image_url: image });
+      continue;
+    }
+    if (String(row.type || "") === "input_file") {
+      const file: Record<string, unknown> = {};
+      if (typeof row.file_id === "string" && row.file_id) {
+        file.file_id = row.file_id;
+      }
+      if (typeof row.filename === "string" && row.filename) {
+        file.filename = row.filename;
+      }
+      if (typeof row.file_data === "string" && row.file_data) {
+        file.file_data = row.file_data;
+      }
+      if (Object.keys(file).length > 0) {
+        hasAttachment = true;
+        parts.push({ type: "file", file });
+      }
     }
   }
 
-  if (!hasImage) return texts.join("");
-  // 带图片时跳过空文本块（Codex 常随图发送空 input_text）。
+  if (!hasAttachment) return texts.join("");
+  // 带附件时跳过空文本块（Codex 常随图发送空 input_text）。
   const nonEmpty = parts.filter(
     (p) =>
       p.type !== "text" ||

@@ -77,6 +77,29 @@ export function chatContentToAnthropicBlocks(
       if (block) blocks.push(block);
       continue;
     }
+    // Chat file 部分 → Anthropic document 块（data URL 形式）。
+    if (type === "file") {
+      const nested = asRecord(part.file);
+      const fileData =
+        typeof nested?.file_data === "string" ? nested.file_data : "";
+      const inline = fileData ? parseDataUrl(fileData) : null;
+      if (inline) {
+        const block: Block = {
+          type: "document",
+          source: {
+            type: "base64",
+            media_type: inline.mediaType,
+            data: inline.data,
+          },
+        };
+        if (typeof nested?.filename === "string" && nested.filename) {
+          block.title = nested.filename;
+        }
+        blocks.push(block);
+      }
+      // file_id 引用是供应商私有资源，Anthropic 上无等价物，跳过。
+      continue;
+    }
     // Already an Anthropic-shaped block (image/document/thinking): keep as-is.
     if (part.source || type === "thinking" || type === "redacted_thinking") {
       blocks.push(part as Block);
