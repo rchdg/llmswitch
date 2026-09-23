@@ -40,6 +40,16 @@ function numberOr(value: unknown): number | undefined {
   return typeof value === "number" ? value : undefined;
 }
 
+/**
+ * Rough token estimate (~4 chars/token) for upstreams that omit `usage`.
+ * Codex reads `response.completed.usage` for its token stats and context
+ * tracking; a null usage breaks both, so an estimate beats nothing.
+ */
+export function estimateTokens(text: string): number {
+  if (!text) return 0;
+  return Math.max(1, Math.round(text.length / 4));
+}
+
 export interface StreamBridgeState {
   responseId: string;
   model: string;
@@ -77,6 +87,11 @@ export interface StreamBridgeState {
   created: boolean;
   completed: boolean;
   usage?: ReturnType<typeof mapUsage>;
+  /**
+   * Approximate prompt tokens (from the translated chat request). Used to
+   * synthesize usage when the upstream omits it entirely.
+   */
+  estimatedInputTokens?: number;
 }
 
 export function createStreamState(
@@ -84,6 +99,7 @@ export function createStreamState(
   responseId?: string,
   customTools?: Iterable<string>,
   webSearchEnabled = false,
+  estimatedInputTokens?: number,
 ): StreamBridgeState {
   return {
     responseId: responseId || newId("resp"),
@@ -104,6 +120,7 @@ export function createStreamState(
     toolCalls: new Map(),
     created: false,
     completed: false,
+    estimatedInputTokens,
   };
 }
 
@@ -662,12 +679,39 @@ function closeTextItem(state: StreamBridgeState, out: string[]): void {
   state.currentText = "";
 }
 
+/**
+ * Fallback usage when the upstream never sent one: estimate from what we
+ * actually streamed so Codex token accounting stays usable. Callers must
+ * snapshot the streamed text before closing items (closeTextItem resets
+ * currentText).
+ */
+function syntheticUsage(
+  state: StreamBridgeState,
+  streamedText: string,
+): ReturnType<typeof mapUsage> {
+  let outputText = streamedText;
+  for (const entry of state.toolCalls.values()) {
+    outputText += entry.arguments;
+  }
+  const output = estimateTokens(outputText);
+  const input = state.estimatedInputTokens ?? 0;
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    total_tokens: input + output,
+    output_tokens_details: { reasoning_tokens: 0 },
+  };
+}
+
 function finalizeStream(
   state: StreamBridgeState,
   out: string[],
   finishReason: string,
 ): void {
   if (state.completed) return;
+
+  // currentText/reasoningText are reset as items close below — snapshot first.
+  const streamedText = state.currentText + state.reasoningText;
 
   flushPendingWebSearchText(state, out);
   if (state.textStarted && state.textItemId) {
@@ -759,7 +803,7 @@ function finalizeStream(
   const response = {
     ...baseResponse(state, status),
     output,
-    usage: state.usage,
+    usage: state.usage ?? syntheticUsage(state, streamedText),
   };
   out.push(sseEvent("response.completed", { response }));
   state.completed = true;
@@ -781,11 +825,12 @@ export function chatCompletionToResponse(
   modelFallback?: string,
   customTools?: Iterable<string>,
   webSearchEnabled = false,
+  estimatedInputTokens?: number,
 ): Record<string, unknown> {
   const id = newId("resp");
   const model = String(chat.model || modelFallback || "");
   const customSet = new Set(customTools ?? []);
-  const usage = mapUsage(
+  let usage = mapUsage(
     chat.usage && typeof chat.usage === "object"
       ? (chat.usage as Record<string, unknown>)
       : undefined,
@@ -877,6 +922,25 @@ export function chatCompletionToResponse(
     finish === "length" || finish === "content_filter"
       ? "incomplete"
       : "completed";
+
+  if (!usage) {
+    // Upstream omitted usage — estimate so clients relying on token counts
+    // (Codex context tracking) keep working.
+    let outputText = content + reasoningText;
+    for (const tcRaw of toolCalls) {
+      const tc = tcRaw as Record<string, unknown>;
+      const fn = (tc.function || {}) as Record<string, unknown>;
+      outputText += typeof fn.arguments === "string" ? fn.arguments : "";
+    }
+    const output = estimateTokens(outputText);
+    const input = estimatedInputTokens ?? 0;
+    usage = {
+      input_tokens: input,
+      output_tokens: output,
+      total_tokens: input + output,
+      output_tokens_details: { reasoning_tokens: 0 },
+    };
+  }
 
   return {
     id,

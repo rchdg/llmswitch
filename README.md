@@ -403,6 +403,31 @@ llms gateway config set --cors-origins https://app.example.com
 
 ---
 
+### 10. 故障转移与排查
+
+主供应商返回 429/5xx、连接失败或超时时，Bridge 会按备用链自动切换重试同一请求；切换发生在流式响应开始前，客户端无感（SSE 流中会插入 `: failover: 主 → 备` 注释帧便于排查）。每个备用供应商按自己的默认模型转发（请求中的模型 ID 自动改写），密钥沿用各自配置。
+
+```bash
+# 启用时直接指定备用链（最多 3 个）
+llms codex use my-provider --fallback backup-a --fallback backup-b
+
+# 随时管理备用链（修改后自动刷新 Bridge 上游）
+llms codex fallback              # 查看当前链
+llms codex fallback add backup-a
+llms codex fallback remove backup-a
+llms codex fallback clear
+
+# 查看最近 200 条数据面请求（状态码、耗时、实际命中的供应商）
+llms bridge logs
+llms bridge logs --limit 20 --json
+
+# 健康检查：连通、认证、生成、流式、元数据与配置一致性
+llms doctor codex
+llms doctor codex --full   # 加测 tool call 与图片输入（会消耗少量 token）
+```
+
+---
+
 ## 常用命令
 
 | 命令 | 说明 |
@@ -412,11 +437,14 @@ llms gateway config set --cors-origins https://app.example.com
 | `llms setup [--tool <tool>]` | 显式引导配置（添加供应商 → 模型 → 启用 → 启动） |
 | `llms <tool> provider` | 交互管理供应商（添加、查看、编辑、删除） |
 | `llms <tool> provider list/add/rm` | 非交互增删查（脚本 / CI 用） |
-| `llms <tool> use [name]` | 启用指定配置 |
+| `llms <tool> use [name]` | 启用指定配置（可加 `--fallback <name>` 指定备用供应商） |
+| `llms <tool> fallback` | 查看/管理故障转移备用链（add / remove / clear） |
 | `llms <tool> current` | 查看当前配置 |
 | `llms <tool> model` | 选择模型 |
 | `llms launch/run <tool> [model]` | 启动工具（加 `--save` 才改默认模型） |
 | `llms bridge status` | 查看 Bridge 状态 |
+| `llms bridge logs` | 查看 Bridge 最近请求（状态码 / 耗时 / 命中上游） |
+| `llms doctor [tool]` | 健康检查：连通、认证、生成、流式、元数据、配置一致性 |
 | `llms gateway start` | 启动对外 AI 网关 |
 | `llms gateway provider import` | 从工具配置导入网关供应商 |
 | `llms gateway provider test <name>` | 测试供应商连通性 |

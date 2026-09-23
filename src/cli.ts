@@ -6,6 +6,7 @@ import { registerBridgeCommand } from "./commands/bridge-cmd.js";
 import { registerGatewayCommand } from "./commands/gateway-cmd.js";
 import { registerSetupCommand } from "./commands/setup-cmd.js";
 import { registerHomeCommand } from "./commands/home-cmd.js";
+import { registerDoctorCommand } from "./commands/doctor-cmd.js";
 import { getAppConfigRoot } from "./utils/paths.js";
 import { getVersion } from "./utils/version.js";
 
@@ -36,6 +37,7 @@ export function createProgram(): Command {
   registerBridgeCommand(program);
   registerGatewayCommand(program);
   registerSetupCommand(program);
+  registerDoctorCommand(program);
 
   for (const tool of TOOLS) {
     registerToolCommand(program, tool);

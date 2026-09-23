@@ -4,6 +4,7 @@ import type { Tool } from "../types.js";
 import { API_FORMATS, isApiFormat, supportsSmallModel } from "../types.js";
 import { applyProfile, deactivateProfile } from "../adapters/index.js";
 import { formatLabel } from "../formats/compatibility.js";
+import { ensureBridgeForProfile, profileNeedsBridge } from "../bridge/manager.js";
 import { PRESET_IDS } from "../presets/index.js";
 import {
   deleteProfile,
@@ -11,6 +12,7 @@ import {
   getActiveProfile,
   getDefaultProfile,
   listProfiles,
+  normalizeFallbackNames,
   publicProfileView,
   requireProfile,
   resolveProfileOrThrow,
@@ -188,31 +190,142 @@ export function registerToolCommand(program: Command, tool: Tool): void {
     .command("use")
     .description("启用已有供应商（写入对应工具配置）")
     .argument("[name]", "供应商名称；省略则交互选择")
+    .option(
+      "--fallback <names...>",
+      "备用供应商（主供应商 429/5xx/超时时按顺序切换，最多 3 个）",
+    )
     .option("--json", "JSON 输出")
-    .action(async (name?: string, opts?: { json?: boolean }) => {
-      ensureDefaultProvider(tool);
-      const profileName = await resolveProfileName(tool, name);
-      let profile = resolveProfileOrThrow(tool, profileName);
+    .action(
+      async (
+        name: string | undefined,
+        opts?: { json?: boolean; fallback?: string[] },
+      ) => {
+        ensureDefaultProvider(tool);
+        const profileName = await resolveProfileName(tool, name);
+        let profile = resolveProfileOrThrow(tool, profileName);
 
-      // 交互模式下：启用前可选切换默认模型
-      if (!opts?.json && process.stdin.isTTY) {
-        profile = await maybePickDefaultModel(tool, profile);
-      }
+        // 交互模式下：启用前可选切换默认模型
+        if (!opts?.json && process.stdin.isTTY) {
+          profile = await maybePickDefaultModel(tool, profile);
+        }
 
-      const result = await applyProfile(tool, profile);
-      if (opts?.json) {
-        console.log(JSON.stringify(result, null, 2));
-        return;
-      }
-      console.log(`已启用 ${tool}/${profile.name}`);
-      console.log(`配置文件：${result.configPath}`);
-      if (result.backupPath) console.log(`备份：${result.backupPath}`);
-      console.log(result.restartHint);
+        if (opts?.fallback) {
+          for (const fallbackName of opts.fallback) {
+            if (fallbackName === profile.name) continue;
+            resolveProfileOrThrow(tool, fallbackName);
+          }
+          profile = {
+            ...profile,
+            fallbacks: opts.fallback,
+          };
+          saveProfile(tool, profile);
+        }
 
-      if (process.stdin.isTTY) {
-        await maybeLaunchNow(tool, profile);
-      }
-    });
+        const result = await applyProfile(tool, profile);
+        if (opts?.json) {
+          console.log(JSON.stringify(result, null, 2));
+          return;
+        }
+        console.log(`已启用 ${tool}/${profile.name}`);
+        const chain = profile.fallbacks?.length
+          ? `（故障转移：${profile.name} → ${profile.fallbacks.join(" → ")}）`
+          : "";
+        console.log(`配置文件：${result.configPath}${chain}`);
+        if (result.backupPath) console.log(`备份：${result.backupPath}`);
+        console.log(result.restartHint);
+
+        if (process.stdin.isTTY) {
+          await maybeLaunchNow(tool, profile);
+        }
+      });
+
+  cmd
+    .command("fallback")
+    .description("查看或管理故障转移备用链（主供应商失败时自动切换）")
+    .argument("[action]", "add <name> | remove <name> | clear；省略则查看")
+    .argument("[name]", "备用供应商名称")
+    .option("--json", "JSON 输出")
+    .action(
+      async (
+        action: string | undefined,
+        name: string | undefined,
+        opts: { json?: boolean },
+      ) => {
+        ensureDefaultProvider(tool);
+        const active = getActiveProfile(tool);
+        if (!active) {
+          throw new Error(
+            `没有已启用的 ${tool} profile。先执行 llms ${tool} use。`,
+          );
+        }
+
+        if (!action) {
+          const chain = active.fallbacks ?? [];
+          if (opts.json) {
+            console.log(JSON.stringify({ profile: active.name, fallbacks: chain }, null, 2));
+            return;
+          }
+          if (chain.length === 0) {
+            console.log(`${active.name} 当前没有备用供应商。`);
+            console.log(`添加：llms ${tool} fallback add <name>`);
+            return;
+          }
+          console.log(`${active.name} 的故障转移链：`);
+          chain.forEach((fallbackName, index) => {
+            console.log(`  ${index === 0 ? "主" : `备${index}`} → ${fallbackName}`);
+          });
+          return;
+        }
+
+        if (action === "clear") {
+          saveProfile(tool, { ...active, fallbacks: [] });
+          console.log(`已清空 ${active.name} 的备用链。`);
+          await maybeReloadBridge(tool, active.name);
+          return;
+        }
+
+        if (!name) {
+          throw new Error(`用法：llms ${tool} fallback ${action} <name>`);
+        }
+
+        if (action === "add") {
+          const fallbackProfile = resolveProfileOrThrow(tool, name);
+          if (fallbackProfile.name === active.name) {
+            throw new Error("备用供应商不能是当前启用的供应商本身。");
+          }
+          const chain = normalizeFallbackNames(active.name, [
+            ...(active.fallbacks ?? []),
+            fallbackProfile.name,
+          ]);
+          saveProfile(tool, { ...active, fallbacks: chain });
+          console.log(
+            chain?.includes(fallbackProfile.name)
+              ? `已添加备用：${active.name} → ${(chain ?? []).join(" → ")}`
+              : `备用链已满（最多 3 个）：${(active.fallbacks ?? []).join(" → ")}`,
+          );
+          await maybeReloadBridge(tool, active.name);
+          return;
+        }
+
+        if (action === "remove") {
+          const fallbackProfile = resolveProfileOrThrow(tool, name);
+          const chain = (active.fallbacks ?? []).filter(
+            (entry) => entry !== fallbackProfile.name,
+          );
+          saveProfile(tool, { ...active, fallbacks: chain });
+          console.log(
+            chain.length > 0
+              ? `已移除，当前链：${active.name} → ${chain.join(" → ")}`
+              : `已移除，${active.name} 没有备用供应商了。`,
+          );
+          await maybeReloadBridge(tool, active.name);
+          return;
+        }
+
+        throw new Error(
+          `未知操作「${action}」。可选：add / remove / clear。`,
+        );
+      });
 
   cmd
     .command("current")
@@ -607,8 +720,30 @@ async function maybePickDefaultModel(
 }
 
 /** 启用完成后：询问是否立即启动该工具。 */
-async function maybeLaunchNow(tool: Tool, profile: Profile): Promise<void> {
-  const launch = await p.confirm({
+/**
+ * After a fallback-chain change: if the touched profile is active and goes
+ * through the bridge, push the new candidate list without a full re-apply.
+ */
+async function maybeReloadBridge(
+  tool: Tool,
+  profileName: string,
+): Promise<void> {
+  const active = getActiveProfile(tool);
+  if (!active || active.name !== profileName) return;
+  if (!profileNeedsBridge(active)) return;
+  try {
+    const connection = await ensureBridgeForProfile(active, tool);
+    console.log(`bridge 上游已刷新 → ${connection.baseUrl}`);
+  } catch (err) {
+    console.warn(
+      `bridge 刷新失败（稍后 llms bridge reload ${tool} 可重试）：${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+}
+
+async function maybeLaunchNow(tool: Tool, profile: Profile): Promise<void> {  const launch = await p.confirm({
     message: `是否现在启动 ${tool}？`,
     initialValue: true,
   });

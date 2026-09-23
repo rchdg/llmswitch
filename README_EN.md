@@ -449,6 +449,36 @@ llms gateway config set --cors-origins https://app.example.com
 
 ---
 
+### 10. Failover & Diagnostics
+
+When the primary provider returns 429/5xx, refuses the connection or times
+out, the Bridge retries the same request along the fallback chain. Failover
+happens before the streaming response starts, so clients never notice (a
+`: failover: primary → backup` comment frame is injected into the SSE stream
+for troubleshooting). Each fallback forwards to its own default model (the
+model id in the request is rewritten) and uses its own credentials.
+
+```bash
+# Specify the chain when enabling (up to 3)
+llms codex use my-provider --fallback backup-a --fallback backup-b
+
+# Manage the chain anytime (the Bridge upstream is refreshed automatically)
+llms codex fallback              # show the current chain
+llms codex fallback add backup-a
+llms codex fallback remove backup-a
+llms codex fallback clear
+
+# Last 200 data-plane requests (status, latency, provider actually used)
+llms bridge logs
+llms bridge logs --limit 20 --json
+
+# Health check: connectivity, auth, completion, streaming, metadata, config
+llms doctor codex
+llms doctor codex --full   # also probes tool calls and image input (costs a few tokens)
+```
+
+---
+
 ## Common Commands
 
 | Command | Description |
@@ -458,11 +488,14 @@ llms gateway config set --cors-origins https://app.example.com
 | `llms setup [--tool <tool>]` | Explicit guided setup (provider → models → enable → launch) |
 | `llms <tool> provider` | Interactive provider management (add, view, edit, delete) |
 | `llms <tool> provider list/add/rm` | Non-interactive add/list/remove (scripts / CI) |
-| `llms <tool> use [name]` | Enable specified configuration |
+| `llms <tool> use [name]` | Enable a configuration (`--fallback <name>` sets failover backups) |
+| `llms <tool> fallback` | View/manage the failover chain (add / remove / clear) |
 | `llms <tool> current` | View current configuration |
 | `llms <tool> model` | Select models |
 | `llms launch/run <tool> [model]` | Launch tool (add `--save` to change the default model) |
 | `llms bridge status` | View Bridge status |
+| `llms bridge logs` | View recent Bridge requests (status / latency / provider) |
+| `llms doctor [tool]` | Health check: connectivity, auth, completion, streaming, metadata, config |
 | `llms gateway start` | Start the outward-facing AI gateway |
 | `llms gateway provider import` | Import gateway providers from tool configs |
 | `llms gateway provider test <name>` | Probe provider connectivity |

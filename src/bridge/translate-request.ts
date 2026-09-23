@@ -428,8 +428,33 @@ export function mapToolChoice(toolChoice: unknown): unknown {
   return toolChoice;
 }
 
+/**
+ * Rough prompt token estimate over translated chat messages (~4 chars/token).
+ * Only used to synthesize usage when the upstream omits it.
+ */
+export function estimateChatInputTokens(messages: ChatMessage[]): number {
+  let text = "";
+  for (const message of messages) {
+    if (typeof message.content === "string") text += message.content;
+    else if (Array.isArray(message.content)) text += extractText(message.content);
+    if (message.tool_calls) {
+      for (const call of message.tool_calls) {
+        text += call.function.name + call.function.arguments;
+      }
+    }
+  }
+  return text ? Math.max(1, Math.round(text.length / 4)) : 0;
+}
+
+/** Metadata-driven request shaping (see responsesToChatRequest). */
+export interface RequestShapingMeta {
+  /** false → drop reasoning_effort (model cannot reason). */
+  supportsReasoning?: boolean;
+}
+
 export function responsesToChatRequest(
   body: Record<string, unknown>,
+  meta?: RequestShapingMeta,
 ): ChatRequest {
   const model = String(body.model || "");
   const messages = responsesInputToMessages(body);
@@ -463,9 +488,13 @@ export function responsesToChatRequest(
     req.max_completion_tokens = maxOut;
   }
 
-  const reasoning = asRecord(body.reasoning);
-  if (reasoning && typeof reasoning.effort === "string") {
-    req.reasoning_effort = reasoning.effort;
+  // 一些上游对不认识的字段（reasoning_effort）直接 400；元数据确认该模型
+  // 不支持推理时裁掉，unknown 时保持现状以免误伤。
+  if (meta?.supportsReasoning !== false) {
+    const reasoning = asRecord(body.reasoning);
+    if (reasoning && typeof reasoning.effort === "string") {
+      req.reasoning_effort = reasoning.effort;
+    }
   }
 
   const text = asRecord(body.text);
@@ -513,6 +542,7 @@ export function chatToCompletionsRequest(chat: ChatRequest): CompletionsRequest 
 
 export function responsesToCompletionsRequest(
   body: Record<string, unknown>,
+  meta?: RequestShapingMeta,
 ): CompletionsRequest {
-  return chatToCompletionsRequest(responsesToChatRequest(body));
+  return chatToCompletionsRequest(responsesToChatRequest(body, meta));
 }

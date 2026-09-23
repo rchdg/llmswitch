@@ -20,6 +20,7 @@ import {
   getCodexHome,
 } from "../utils/paths.js";
 import { setActiveProfile } from "../store/profiles.js";
+import { enrichProfileModelMeta } from "../utils/model-metadata.js";
 import {
   clearBridgeUpstream,
   ensureBridgeForProfile,
@@ -213,10 +214,16 @@ function escapeEnv(value: string): string {
 }
 
 export async function applyCodexProfile(
-  profile: Profile,
+  inputProfile: Profile,
 ): Promise<ApplyResult> {
-  assertCompatible("codex", profile.apiFormat);
+  assertCompatible("codex", inputProfile.apiFormat);
   ensureDir(getCodexHome());
+
+  // 手动输入的模型 ID 可能没有元数据；use 时从 models.lonae.com 补齐一次
+  // （带 24h 缓存），Codex 才能拿到 model_context_window 做上下文压缩判断。
+  const profile = await enrichProfileModelMeta(inputProfile, {
+    proxy: inputProfile.proxy,
+  });
 
   let effectiveBaseUrl = normalizeBaseUrlForFormat(
     profile.apiFormat,

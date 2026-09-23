@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { Profile, Tool } from "../types.js";
+import { readProfile } from "../store/profiles.js";
 import { normalizeBaseUrlForFormat } from "../utils/base-url.js";
 import {
   bridgeBaseUrl,
@@ -80,6 +81,9 @@ export function upstreamFromProfile(
 ): BridgeUpstream {
   const mode: BridgeUpstreamMode =
     tool === "claude" ? "chat" : profile.bridgeMode || "chat";
+  // 模型元数据随 upstream 一起下发，bridge 据此裁剪请求参数（如
+  // reasoning_effort），无需在数据面上再查一次目录。
+  const meta = profile.models.meta?.[profile.models.default];
   return {
     baseUrl: normalizeBaseUrlForFormat(profile.apiFormat, profile.baseUrl),
     apiKey: profile.apiKey,
@@ -90,7 +94,46 @@ export function upstreamFromProfile(
     updatedAt: new Date().toISOString(),
     clientToken,
     migrationRequired: !clientToken,
+    model: profile.models.default,
+    modelContextWindow:
+      typeof meta?.context === "number" && meta.context > 0
+        ? Math.round(meta.context)
+        : undefined,
+    modelSupportsReasoning:
+      typeof meta?.reasoning === "boolean" ? meta.reasoning : undefined,
+    modelInputModalities: meta?.modalities?.input?.filter(Boolean),
   };
+}
+
+/** Resolve a profile's failover chain into upstream candidates. */
+export function resolveFallbackUpstreams(
+  profile: Profile,
+  tool: BridgeTool,
+): BridgeUpstream[] | undefined {
+  const names = (profile.fallbacks ?? []).filter(
+    (name, index) =>
+      name !== profile.name && profile.fallbacks?.indexOf(name) === index,
+  );
+  if (names.length === 0) return undefined;
+  const candidates: BridgeUpstream[] = [];
+  for (const name of names) {
+    const fallbackProfile = readProfile(tool, name);
+    if (!fallbackProfile) {
+      console.warn(
+        `注意：备用供应商「${name}」不存在，已跳过（llms ${tool} fallback list 查看）`,
+      );
+      continue;
+    }
+    // 候选不再嵌套自己的 fallbacks（只支持一层链）。
+    const { fallbacks: _ignored, ...upstream } = upstreamFromProfile(
+      fallbackProfile,
+      tool,
+      null,
+    );
+    upstream.clientToken = null;
+    candidates.push(upstream);
+  }
+  return candidates.length > 0 ? candidates : undefined;
 }
 
 export type BridgeProbe = {
@@ -218,7 +261,11 @@ export async function ensureBridgeForProfile(
   }
 
   const clientToken = generateBridgeToken();
-  const upstream = upstreamFromProfile(profile, tool, clientToken);
+  const fallbacks = resolveFallbackUpstreams(profile, tool);
+  const upstream: BridgeUpstream = {
+    ...upstreamFromProfile(profile, tool, clientToken),
+    ...(fallbacks ? { fallbacks } : {}),
+  };
   const configured = updateBridgeState((state) => ({
     ...state,
     listener,

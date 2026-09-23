@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ProxyConfig } from "../types.js";
+import type { Profile, ProxyConfig } from "../types.js";
 import { requestWithNodeTransport } from "../bridge/transport.js";
 import { atomicWriteFile } from "./fs.js";
 import { getAppConfigRoot } from "./paths.js";
@@ -223,6 +223,44 @@ export function collectModelMeta(
     if (found) meta[id] = found;
   }
   return Object.keys(meta).length > 0 ? meta : undefined;
+}
+
+function metaIsKnown(meta: ModelMeta | undefined): boolean {
+  return Boolean(
+    meta &&
+      ((typeof meta.context === "number" && meta.context > 0) ||
+        typeof meta.reasoning === "boolean"),
+  );
+}
+
+/**
+ * Ensure the profile's active model carries lonae.com metadata (context
+ * window, reasoning, modalities). No-op when selection already saved it;
+ * otherwise one cached fetch (24h TTL) fills it in. Failures never block
+ * the caller — worst case Codex just doesn't get model_context_window.
+ */
+export async function enrichProfileModelMeta(
+  profile: Profile,
+  options: { proxy?: ProxyConfig } = {},
+): Promise<Profile> {
+  const modelId = profile.models.default;
+  if (!modelId) return profile;
+  if (metaIsKnown(profile.models.meta?.[modelId])) return profile;
+
+  try {
+    const catalog = await fetchModelMetadata({ proxy: options.proxy });
+    const found = lookupModelMeta(catalog, modelId);
+    if (!found) return profile;
+    return {
+      ...profile,
+      models: {
+        ...profile.models,
+        meta: { ...profile.models.meta, [modelId]: found },
+      },
+    };
+  } catch {
+    return profile;
+  }
 }
 
 /**

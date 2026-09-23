@@ -96,6 +96,11 @@ export interface Profile {
    * Default: chat. Set completions for /v1/completions-only upstreams.
    */
   bridgeMode?: "chat" | "completions";
+  /**
+   * Failover chain: other profile names tried in order when this provider
+   * fails with a retryable error (429/5xx/timeout). Max 3, self excluded.
+   */
+  fallbacks?: string[];
   updatedAt: string;
 }
 

@@ -167,6 +167,31 @@ export function resolveProfileOrThrow(tool: Tool, query: string): Profile {
   return profile;
 }
 
+/** Max failover candidates per profile — chains stay predictable. */
+const MAX_FALLBACKS = 3;
+
+/**
+ * Clean a failover chain: drop self references, duplicates and unknown names
+ * are validated by the caller; cap the length.
+ */
+export function normalizeFallbackNames(
+  profileName: string,
+  fallbacks: unknown,
+): string[] | undefined {
+  if (!Array.isArray(fallbacks)) return undefined;
+  const seen = new Set<string>();
+  const names: string[] = [];
+  for (const raw of fallbacks) {
+    if (typeof raw !== "string") continue;
+    const name = raw.trim();
+    if (!name || name === profileName || seen.has(name)) continue;
+    seen.add(name);
+    names.push(name);
+    if (names.length >= MAX_FALLBACKS) break;
+  }
+  return names.length > 0 ? names : undefined;
+}
+
 export function saveProfile(tool: Tool, profile: Profile): void {
   assertValidProfileName(profile.name);
   if (!isApiFormat(profile.apiFormat)) {
@@ -206,6 +231,7 @@ export function saveProfile(tool: Tool, profile: Profile): void {
       meta,
     },
     headers: profile.headers || {},
+    fallbacks: normalizeFallbackNames(profile.name, profile.fallbacks),
     updatedAt: new Date().toISOString(),
   };
   ensureToolStore(tool);
@@ -297,6 +323,7 @@ export function publicProfileView(profile: Profile) {
     apiKey: maskSecret(profile.apiKey),
     models: profile.models,
     proxy: profile.proxy || null,
+    fallbacks: profile.fallbacks ?? [],
     updatedAt: profile.updatedAt,
   };
 }
@@ -353,6 +380,7 @@ function normalizeProfile(raw: Profile, fallbackName: string): Profile {
     proxy: normalizeProxyValue(raw.proxy),
     bridgeMode: raw.bridgeMode,
     headers: raw.headers || {},
+    fallbacks: normalizeFallbackNames(name, raw.fallbacks),
     updatedAt: raw.updatedAt || new Date(0).toISOString(),
   };
 }

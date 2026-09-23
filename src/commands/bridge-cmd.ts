@@ -19,6 +19,7 @@ import { parseBridgePort } from "../bridge/runtime.js";
 import { DEFAULT_BRIDGE_HOST, DEFAULT_BRIDGE_PORT } from "../bridge/types.js";
 import { getActiveProfile, resolveProfileOrThrow } from "../store/profiles.js";
 import { TOOLS, isTool } from "../types.js";
+import type { BridgeLogEntry as BridgeLogEntryView } from "../bridge/logs.js";
 
 export function registerBridgeCommand(program: Command): void {
   const bridge = program
@@ -99,6 +100,9 @@ export function registerBridgeCommand(program: Command): void {
               mode: upstream.mode,
               profile: upstream.profileName || null,
               hasKey: Boolean(upstream.apiKey),
+              fallbacks: (upstream.fallbacks ?? [])
+                .map((candidate) => candidate.profileName || candidate.baseUrl)
+                .join(" → ") || null,
             }
           : null;
       const data = {
@@ -126,8 +130,9 @@ export function registerBridgeCommand(program: Command): void {
       for (const tool of ["codex", "claude", "opencode"] as const) {
         const u = data.upstreams[tool];
         if (u) {
+          const fallbackNote = u.fallbacks ? `，备用 ${u.fallbacks}` : "";
           console.log(
-            `${tool} 上游：${u.baseUrl}（${u.mode}） profile=${u.profile ?? "-"}`,
+            `${tool} 上游：${u.baseUrl}（${u.mode}） profile=${u.profile ?? "-"}${fallbackNote}`,
           );
         } else {
           console.log(`${tool} 上游：未配置`);
@@ -167,5 +172,46 @@ export function registerBridgeCommand(program: Command): void {
       console.log(
         `已刷新 ${tool} 上游 ${profile.name} → bridge ${connection.baseUrl}`,
       );
+    });
+
+  bridge
+    .command("logs")
+    .description("查看 bridge 最近处理的数据面请求（进程内存，最多 200 条）")
+    .option("--limit <n>", "显示条数", "50")
+    .option("--json", "JSON 输出")
+    .action(async (opts: { limit?: string; json?: boolean }) => {
+      const state = readBridgeState();
+      const instance = state.instance;
+      if (!(await isBridgeAlive(state.listener.advertiseHost, state.listener.port)) || !instance) {
+        throw new Error("bridge 未运行，没有可查看的日志。");
+      }
+      const limit = Math.max(1, Math.min(200, Number(opts.limit) || 50));
+      const url = `http://${(state.listener.advertiseHost || "127.0.0.1").replace(/^::1$/, "[::1]")}:${state.listener.port}/_control/logs?limit=${limit}`;
+      const response = await fetch(url, {
+        headers: { "x-llm-switch-control": instance.controlToken },
+        signal: AbortSignal.timeout(3000),
+      });
+      if (!response.ok) {
+        throw new Error(`读取日志失败：HTTP ${response.status}`);
+      }
+      const payload = (await response.json()) as { entries?: BridgeLogEntryView[] };
+      const entries = payload.entries ?? [];
+      if (opts.json) {
+        console.log(JSON.stringify(entries, null, 2));
+        return;
+      }
+      if (entries.length === 0) {
+        console.log("暂无请求记录。发一次消息后再查看。");
+        return;
+      }
+      for (const entry of entries) {
+        const time = entry.ts ? entry.ts.slice(11, 19) : "-";
+        const model = entry.model || "-";
+        const statusLine = `${entry.status} ${entry.durationMs}ms`;
+        const error = entry.error ? ` ⚠ ${entry.error}` : "";
+        console.log(
+          `${time} ${entry.tool.padEnd(8)} ${entry.path.padEnd(22)} ${model.padEnd(28)} ${statusLine}${error}`,
+        );
+      }
     });
 }

@@ -17,6 +17,19 @@ export interface BridgeUpstream {
   clientToken?: string | null;
   /** Legacy state cannot authenticate this side until it is reapplied. */
   migrationRequired?: boolean;
+  /** Context window of the active model (models.lonae.com metadata). */
+  modelContextWindow?: number;
+  /** Whether the active model supports reasoning; undefined = unknown. */
+  modelSupportsReasoning?: boolean;
+  /** Input modalities of the active model (text/image/pdf/...). */
+  modelInputModalities?: string[];
+  /** Default model of this candidate; rewrite the client's request to it. */
+  model?: string;
+  /**
+   * Failover candidates tried in order after a retryable failure of this
+   * upstream. They never serve client auth (clientToken lives on the primary).
+   */
+  fallbacks?: BridgeUpstream[];
 }
 
 export interface BridgeUpstreams {
