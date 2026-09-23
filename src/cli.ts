@@ -17,7 +17,9 @@ export function createProgram(): Command {
     .description(
       "为 Claude Code / Codex / OpenCode 切换供应商、模型与上游代理",
     )
-    .version(getVersion())
+    // 版本号读取自 package.json。commander 的 version() 只接受一个短选项，
+    // 这里显式指定为 -v（默认是 -V）。
+    .version(getVersion(), "-v, --version", "显示版本号")
     // 注意：不要在根命令上声明 --json。commander 会把它当作根命令的选项，
     // 从而吞掉所有子命令自己的 --json（子命令 opts.json 恒为 undefined）。
     // JSON 输出一律由各子命令自行声明。

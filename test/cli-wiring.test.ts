@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createProgram } from "../src/cli.ts";
+import { getVersion } from "../src/utils/version.ts";
 import { saveProfile } from "../src/store/profiles.ts";
 import type { Profile } from "../src/types.ts";
 
@@ -99,5 +100,49 @@ describe("cli --json wiring", () => {
     expect(withJson).toContain("bridge status");
     expect(withJson).toContain("gateway status");
     expect(withJson).toContain("launch");
+  });
+});
+
+describe("version flag", () => {
+  /**
+   * Run `-v`/`--version` and capture the version commander writes to stdout.
+   *
+   * exitOverride() is required: without it commander's version handler calls
+   * process.exit(0) and tears down the whole test runner.
+   */
+  async function runVersionFlag(flag: string): Promise<string> {
+    const chunks: string[] = [];
+    const original = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((str: string | Uint8Array) => {
+      chunks.push(typeof str === "string" ? str : Buffer.from(str).toString());
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      await createProgram().exitOverride().parseAsync(["node", "llms", flag]);
+    } catch {
+      // commander.version throws under exitOverride; the output is what matters.
+    } finally {
+      process.stdout.write = original;
+    }
+    return chunks.join("").trim();
+  }
+
+  test("-v prints the package.json version", async () => {
+    const pkg = JSON.parse(
+      await Bun.file(new URL("../package.json", import.meta.url)).text(),
+    ) as { version: string };
+    expect(pkg.version).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(await runVersionFlag("-v")).toBe(pkg.version);
+  });
+
+  test("--version prints the same version", async () => {
+    expect(await runVersionFlag("--version")).toBe(getVersion());
+  });
+
+  test("the root program advertises -v, not -V", () => {
+    const versionOption = createProgram().options.find((opt) =>
+      opt.long === "--version",
+    );
+    expect(versionOption?.short).toBe("-v");
   });
 });
