@@ -121,6 +121,57 @@ describe("responsesToChatRequest", () => {
       "web_search",
     ]);
   });
+  test("keeps input_image parts when translating to chat content", () => {
+    // Regression: Codex 附加图片（view_image / @file）时图片被静默丢弃，
+    // 上游模型完全收不到图。
+    const url = "data:image/png;base64,iVBORw0KGgo=";
+    const chat = responsesToChatRequest({
+      model: "m",
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: [
+            { type: "input_text", text: "看这张图" },
+            { type: "input_image", image_url: url, detail: "high" },
+          ],
+        },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_image", image_url: url }],
+        },
+      ],
+    });
+
+    const first = chat.messages[0]?.content as Array<Record<string, unknown>>;
+    expect(first).toEqual([
+      { type: "text", text: "看这张图" },
+      { type: "image_url", image_url: { url, detail: "high" } },
+    ]);
+    // 图片-only 消息不能退化为空字符串 content
+    const second = chat.messages[1]?.content as Array<Record<string, unknown>>;
+    expect(second).toEqual([
+      { type: "image_url", image_url: { url } },
+    ]);
+  });
+
+  test("joins plain text messages into a string like before", () => {
+    const chat = responsesToChatRequest({
+      model: "m",
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: [
+            { type: "input_text", text: "a" },
+            { type: "input_text", text: "b" },
+          ],
+        },
+      ],
+    });
+    expect(chat.messages[0]?.content).toBe("ab");
+  });
 });
 
 describe("mapResponsesTools / collectCustomToolNames", () => {

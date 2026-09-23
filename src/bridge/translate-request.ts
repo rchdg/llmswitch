@@ -87,6 +87,60 @@ function mapRole(role: unknown): string {
 }
 
 /**
+ * Responses 消息内容 → Chat 消息内容。
+ * 纯文本照旧合并为字符串；含 `input_image` 时输出多部分内容，把图片转成
+ * Chat 的 `image_url` 块（data:/https: URL 原样透传），否则模型看不到附件图片。
+ */
+function messageContent(
+  content: unknown,
+): string | Array<Record<string, unknown>> {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  const parts: Array<Record<string, unknown>> = [];
+  const texts: string[] = [];
+  let hasImage = false;
+  for (const part of content) {
+    const row = asRecord(part);
+    if (!row) continue;
+    const text =
+      typeof row.text === "string"
+        ? row.text
+        : typeof row.input_text === "string"
+          ? row.input_text
+          : typeof row.output_text === "string"
+            ? row.output_text
+            : undefined;
+    if (text !== undefined) {
+      texts.push(text);
+      parts.push({ type: "text", text });
+      continue;
+    }
+    if (
+      String(row.type || "") === "input_image" &&
+      typeof row.image_url === "string" &&
+      row.image_url
+    ) {
+      hasImage = true;
+      const image: Record<string, unknown> = { url: row.image_url };
+      if (typeof row.detail === "string" && row.detail) {
+        image.detail = row.detail;
+      }
+      parts.push({ type: "image_url", image_url: image });
+    }
+  }
+
+  if (!hasImage) return texts.join("");
+  // 带图片时跳过空文本块（Codex 常随图发送空 input_text）。
+  const nonEmpty = parts.filter(
+    (p) =>
+      p.type !== "text" ||
+      (typeof p.text === "string" && p.text.trim() !== ""),
+  );
+  return nonEmpty.length ? nonEmpty : parts;
+}
+
+/**
  * Convert Responses `input` (+ instructions) into Chat `messages`.
  */
 export function responsesInputToMessages(
@@ -131,8 +185,7 @@ export function responsesInputToMessages(
     if (type === "message") {
       flushToolCalls();
       const role = mapRole(item.role);
-      const text = extractText(item.content);
-      messages.push({ role, content: text });
+      messages.push({ role, content: messageContent(item.content) });
       continue;
     }
 
