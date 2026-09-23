@@ -5,6 +5,7 @@ import type { Agent } from "node:http";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { SocksProxyAgent } from "socks-proxy-agent";
 import type { ProxyConfig } from "../types.js";
+import { fallbackOpenCodeSessionHeaders } from "../utils/session.js";
 
 const SUPPORTED_TARGET_PROTOCOLS = new Set(["http:", "https:"]);
 const SUPPORTED_PROXY_PROTOCOLS = new Set([
@@ -389,6 +390,17 @@ function performRequest(
 
   const headers = sanitizeHeaders(options.headers);
   const bodyBuffer = normalizeBody(options.body);
+  // 兜底：bridge / gateway 会自行推导会话头，但 CLI 直连的请求（模型列表、
+  // 格式探测等）不经过那两层。放在这里保证任何发往 OpenCode 上游的请求都带上。
+  for (const [name, value] of Object.entries(
+    fallbackOpenCodeSessionHeaders({
+      url: target.toString(),
+      headers,
+      bodyText: bodyBuffer?.toString("utf8"),
+    }),
+  )) {
+    headers[name] = value;
+  }
   if (bodyBuffer) {
     headers["Content-Length"] = String(bodyBuffer.byteLength);
   }

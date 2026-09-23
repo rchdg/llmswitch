@@ -72,6 +72,10 @@ For custom upstreams, the API type (Anthropic / OpenAI Chat / OpenAI Responses) 
 
 An "OpenCode Go" preset is also available: it prefills the Zen Go endpoint `https://opencode.ai/zen/go/v1` plus the common models, over Chat Completions. Note that Zen Go splits protocols per model: Grok / GPT / Muse Spark use `/v1/responses`, and MiniMax / Qwen use `/v1/messages` — those need a separate profile with the matching format.
 
+Zen Go requires an `x-opencode-session` header on every request (a missing one returns `MissingSessionID`). llms adds it before forwarding through the bridge or the gateway: a session header from the client is passed through untouched, and otherwise it is derived from the request body (model + first messages) so every turn of one conversation keeps reusing the same session instead of losing prompt-cache locality. A derived id rotates once per hour (at the top of the hour) so a forged session is not reused indefinitely; a client-supplied header is never touched.
+
+Every outbound request to an OpenCode host is additionally backfilled with the header at the transport layer (an existing one is left untouched), so direct CLI calls such as model listing and format probing — which never pass through the bridge or gateway — cannot fail for a missing session id either.
+
 Profile names are auto-generated (5 random lowercase letters/digits, e.g. `69pjb`). Every command accepts either the name or the display name to reference a provider:
 
 ```bash

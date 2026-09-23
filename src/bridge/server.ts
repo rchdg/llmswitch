@@ -36,6 +36,7 @@ import {
   parseChatSseLine as parseChatSseLineResponses,
 } from "./translate-response.js";
 import { modelItemId, modelsFromPayload } from "../utils/fetch-models.js";
+import { openCodeSessionHeaders } from "../utils/session.js";
 
 export interface BridgeServerOptions {
   controlToken?: string;
@@ -186,12 +187,13 @@ function requestUpstream(
   method: "GET" | "POST",
   body?: string,
   signal?: AbortSignal,
+  sessionHeaders: Record<string, string> = {},
 ): Promise<NodeTransportResponse> {
   const limits = parseBridgeRuntimeLimits();
   return requestWithNodeTransport({
     url,
     method,
-    headers: upstreamHeaders(upstream),
+    headers: mergeUpstreamHeaders(upstream, sessionHeaders),
     body,
     proxy: upstream.proxy,
     signal,
@@ -202,12 +204,55 @@ function requestUpstream(
   });
 }
 
+/** 显式配置的上游请求头优先于本地推导出的会话头（按名称不区分大小写）。 */
+function mergeUpstreamHeaders(
+  upstream: BridgeUpstream,
+  sessionHeaders: Record<string, string>,
+): Record<string, string> {
+  const headers = upstreamHeaders(upstream);
+  const configured = new Set(
+    Object.keys(headers).map((name) => name.toLowerCase()),
+  );
+  for (const [name, value] of Object.entries(sessionHeaders)) {
+    if (configured.has(name.toLowerCase())) continue;
+    headers[name] = value;
+  }
+  return headers;
+}
+
+/**
+ * 上游要求时（OpenCode Go）补上会话头：优先沿用客户端自己的会话标识，否则从
+ * 请求体的稳定前缀推导，保证同一会话的多轮请求复用同一个上游会话。
+ *
+ * 导出供测试直接验证推导结果；实际发送由 requestUpstream 完成。
+ */
+export function sessionHeadersFor(
+  req: IncomingMessage | undefined,
+  upstream: BridgeUpstream,
+  bodyText?: string,
+): Record<string, string> {
+  return openCodeSessionHeaders({
+    baseUrl: upstream.baseUrl,
+    headers: req?.headers,
+    bodyText,
+    fallbackSeed: upstream.profileName || upstream.baseUrl,
+  });
+}
+
 async function fetchModelsJson(
   upstream: BridgeUpstream,
   signal?: AbortSignal,
+  req?: IncomingMessage,
 ): Promise<{ ok: boolean; status: number; data: unknown[] }> {
   const url = joinUrl(upstream.baseUrl, "/models");
-  const response = await requestUpstream(upstream, url, "GET", undefined, signal);
+  const response = await requestUpstream(
+    upstream,
+    url,
+    "GET",
+    undefined,
+    signal,
+    sessionHeadersFor(req, upstream),
+  );
   if (!response.ok) {
     return { ok: false, status: response.status, data: [] };
   }
@@ -220,7 +265,7 @@ async function fetchModelsJson(
 }
 
 async function proxyModelsMerged(
-  _req: IncomingMessage,
+  req: IncomingMessage,
   res: ServerResponse,
   upstreams: BridgeUpstreams,
   signal?: AbortSignal,
@@ -236,7 +281,7 @@ async function proxyModelsMerged(
   }
 
   const results = await Promise.all(
-    sides.map((u) => fetchModelsJson(u, signal).catch(() => ({
+    sides.map((u) => fetchModelsJson(u, signal, req).catch(() => ({
       ok: false as const,
       status: 502,
       data: [] as unknown[],
@@ -293,7 +338,7 @@ async function handleResponses(
 }
 
 async function handleMessages(
-  _req: IncomingMessage,
+  req: IncomingMessage,
   res: ServerResponse,
   upstream: BridgeUpstream,
   bodyBuf: Buffer,
@@ -312,6 +357,7 @@ async function handleMessages(
 
   const wantStream = Boolean(body.stream);
   const chatReq = anthropicToChatRequest(body);
+  const chatBody = JSON.stringify(chatReq);
   const url = joinUrl(upstream.baseUrl, "/chat/completions");
 
   let response: NodeTransportResponse;
@@ -320,8 +366,9 @@ async function handleMessages(
       upstream,
       url,
       "POST",
-      JSON.stringify(chatReq),
+      chatBody,
       signal,
+      sessionHeadersFor(req, upstream, chatBody),
     );
   } catch (err) {
     sendJson(res, 502, {
@@ -371,6 +418,7 @@ async function forwardChatResponses(
 ): Promise<void> {
   const chatReq = responsesToChatRequest(body);
   const customTools = collectCustomToolNames(body.tools);
+  const chatBody = JSON.stringify(chatReq);
   const url = joinUrl(upstream.baseUrl, "/chat/completions");
 
   let response: NodeTransportResponse;
@@ -379,8 +427,9 @@ async function forwardChatResponses(
       upstream,
       url,
       "POST",
-      JSON.stringify(chatReq),
+      chatBody,
       signal,
+      sessionHeadersFor(req, upstream, chatBody),
     );
   } catch (err) {
     sendJson(res, 502, {
@@ -435,7 +484,7 @@ async function forwardChatResponses(
  * and relay the raw response, preserving streaming for SSE.
  */
 async function forwardOpenCodeChat(
-  _req: IncomingMessage,
+  req: IncomingMessage,
   res: ServerResponse,
   upstream: BridgeUpstream,
   bodyBuf: Buffer,
@@ -451,6 +500,7 @@ async function forwardOpenCodeChat(
 
   const wantStream = Boolean(body.stream);
   const url = joinUrl(upstream.baseUrl, "/chat/completions");
+  const rawBody = bodyBuf.toString("utf8");
 
   let response: NodeTransportResponse;
   try {
@@ -458,8 +508,9 @@ async function forwardOpenCodeChat(
       upstream,
       url,
       "POST",
-      bodyBuf.toString("utf8"),
+      rawBody,
       signal,
+      sessionHeadersFor(req, upstream, rawBody),
     );
   } catch (err) {
     sendJson(res, 502, {
@@ -494,14 +545,16 @@ async function forwardOpenCodeChat(
 }
 
 async function forwardCompletions(
-  _req: IncomingMessage,
+  req: IncomingMessage,
   res: ServerResponse,
   upstream: BridgeUpstream,
   body: Record<string, unknown>,
   wantStream: boolean,
   signal?: AbortSignal,
-): Promise<void> {  const completionReq = responsesToCompletionsRequest(body);
+): Promise<void> {
+  const completionReq = responsesToCompletionsRequest(body);
   const customTools = collectCustomToolNames(body.tools);
+  const completionBody = JSON.stringify(completionReq);
   const url = joinUrl(upstream.baseUrl, "/completions");
 
   let response: NodeTransportResponse;
@@ -510,8 +563,9 @@ async function forwardCompletions(
       upstream,
       url,
       "POST",
-      JSON.stringify(completionReq),
+      completionBody,
       signal,
+      sessionHeadersFor(req, upstream, completionBody),
     );
   } catch (err) {
     sendJson(res, 502, {

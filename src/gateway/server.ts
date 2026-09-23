@@ -58,6 +58,7 @@ import {
   readGatewayConfig,
 } from "./store.js";
 import { constantTimeTokenEqual, readGatewayState } from "./state.js";
+import { openCodeSessionHeaders } from "../utils/session.js";
 import { ProviderBreaker } from "./health.js";
 import { countAnthropicInputTokens } from "./tokens.js";
 import { recordUsage } from "./usage.js";
@@ -217,9 +218,22 @@ const FORWARDED_CLIENT_HEADERS = [
   "openai-beta",
 ] as const;
 
+export interface UpstreamHeaderOptions {
+  /** Body about to be sent upstream; used to derive a session id when the client sent none. */
+  bodyText?: string;
+  /**
+   * Request whose session headers should be preserved. Defaults to `req`.
+   * Kept separate because `req` is only relayed wholesale on a
+   * format-preserving passthrough, while the session id is worth preserving
+   * even when the payload is translated.
+   */
+  sessionReq?: IncomingMessage;
+}
+
 export function buildUpstreamHeaders(
   provider: GatewayProvider,
   req?: IncomingMessage,
+  options: UpstreamHeaderOptions = {},
 ): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: "application/json",
@@ -258,6 +272,18 @@ export function buildUpstreamHeaders(
     }
     // Correlate upstream calls with the gateway request id.
     headers["x-request-id"] = requestIdOf(req);
+  }
+
+  // OpenCode Go 现在强制要求会话头；显式配置的同名上游请求头优先。
+  const sessionHeaders = openCodeSessionHeaders({
+    baseUrl: provider.baseUrl,
+    headers: (options.sessionReq ?? req)?.headers,
+    bodyText: options.bodyText,
+    fallbackSeed: provider.name,
+  });
+  for (const [name, value] of Object.entries(sessionHeaders)) {
+    if (providerHeaderNames.has(name.toLowerCase())) continue;
+    headers[name] = value;
   }
   return headers;
 }
@@ -920,6 +946,7 @@ async function forwardCompletion(
             ...hubRequest,
             model: candidate.model,
           });
+      const upstreamBodyText = JSON.stringify(upstreamBody);
 
       let response: NodeTransportResponse;
       try {
@@ -928,8 +955,12 @@ async function forwardCompletion(
           method: "POST",
           // Relay beta headers only when the wire format is preserved; a
           // translated request has no guarantee the beta flag still applies.
-          headers: buildUpstreamHeaders(provider, passthrough ? ctx.req : undefined),
-          body: JSON.stringify(upstreamBody),
+          headers: buildUpstreamHeaders(
+            provider,
+            passthrough ? ctx.req : undefined,
+            { bodyText: upstreamBodyText, sessionReq: ctx.req },
+          ),
+          body: upstreamBodyText,
           ...transportOptionsFor(provider, limits, abort.signal),
         });
       } catch (err) {
@@ -1204,11 +1235,17 @@ async function forwardEmbeddings(
       const hasMore = index < usable.length - 1;
       let response: NodeTransportResponse;
       try {
+        const embeddingsBody = JSON.stringify({
+          ...inbound.body,
+          model: candidate.model,
+        });
         response = await requestWithNodeTransport({
           url: upstreamUrl(candidate.provider, "/embeddings"),
           method: "POST",
-          headers: buildUpstreamHeaders(candidate.provider, ctx.req),
-          body: JSON.stringify({ ...inbound.body, model: candidate.model }),
+          headers: buildUpstreamHeaders(candidate.provider, ctx.req, {
+            bodyText: embeddingsBody,
+          }),
+          body: embeddingsBody,
           ...transportOptionsFor(candidate.provider, limits, abort.signal),
         });
       } catch (err) {
@@ -1301,11 +1338,17 @@ async function forwardCountTokens(
   if (native) {
     const abort = clientAbortSignal(ctx.req, res);
     try {
+      const countTokensBody = JSON.stringify({
+        ...inbound.body,
+        model: native.model,
+      });
       const response = await requestWithNodeTransport({
         url: upstreamUrl(native.provider, "/messages/count_tokens"),
         method: "POST",
-        headers: buildUpstreamHeaders(native.provider, ctx.req),
-        body: JSON.stringify({ ...inbound.body, model: native.model }),
+        headers: buildUpstreamHeaders(native.provider, ctx.req, {
+          bodyText: countTokensBody,
+        }),
+        body: countTokensBody,
         ...transportOptionsFor(native.provider, limits, abort.signal),
       });
       const text = await response.text().catch(() => "");

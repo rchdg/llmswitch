@@ -251,6 +251,30 @@ describe("node transport behavior", () => {
     expect(proxy.requests[1]).toEqual({ atyp: 0x03, host: "localhost" });
   });
 
+  test("injects no session header for non-opencode targets and keeps a caller's own", async () => {
+    let received: Record<string, string | string[] | undefined> = {};
+    const target = createServer((req, res) => {
+      received = req.headers;
+      res.end("ok");
+    });
+    const port = await listen(target);
+
+    // A local upstream is not OpenCode: the transport-level fallback adds nothing.
+    await requestWithNodeTransport({ url: `http://127.0.0.1:${port}/models` });
+    expect(received["x-opencode-session"]).toBeUndefined();
+
+    // A caller-provided header survives verbatim (this is the bridge/gateway path,
+    // where the session id is derived from the client request or body).
+    const client = `ses_${"9c".repeat(16)}`;
+    await requestWithNodeTransport({
+      url: `http://127.0.0.1:${port}/chat/completions`,
+      method: "POST",
+      headers: { "x-opencode-session": client },
+      body: JSON.stringify({ model: "glm-5.3" }),
+    });
+    expect(received["x-opencode-session"]).toBe(client);
+  });
+
   test("follows same-origin redirects and rejects cross-origin redirects", async () => {
     let crossOriginHits = 0;
     const other = createServer((_req, res) => {

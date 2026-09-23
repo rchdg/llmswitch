@@ -73,6 +73,10 @@ llms opencode provider
 
 预设中还有「OpenCode Go」，一键预填 Zen Go 的端点 `https://opencode.ai/zen/go/v1` 与常用模型，走 Chat Completions。注意 Zen Go 按模型分流协议：Grok / GPT / Muse Spark 走 `/v1/responses`，MiniMax / Qwen 走 `/v1/messages`，这两类模型需另建对应格式的供应商。
 
+Zen Go 要求每个请求带上 `x-opencode-session`（缺失会返回 `MissingSessionID`）。llms 在 bridge 与网关转发前会自动补齐：客户端自己发了该头就原样透传，没发则从请求体（模型 + 首批消息）推导，因此同一会话的多轮请求始终复用一个会话，不会丢掉 prompt 缓存。推导出的会话标识每小时轮换一次（整点换新），避免长期复用同一个伪造会话；客户端自带的会话头不受影响。
+
+此外，发送到 OpenCode 域名的所有出站请求都会在传输层兜底补一次该头（已携带则保持不动）：模型列表、格式探测这类不经过 bridge / 网关的直连请求同样不会因缺少它会话标识而失败。
+
 Profile 名称会自动生成（5 位随机小写字母数字，如 `69pjb`），所有命令都可通过名称或显示名称引用供应商：
 
 ```bash
