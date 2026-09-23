@@ -423,6 +423,18 @@ function parsePlaintext(
   return { id, secret };
 }
 
+/**
+ * Extract the secret half of a plaintext key, or `""` when the input is not a
+ * well-formed key.
+ *
+ * The secret is `base64url`, whose alphabet includes `-`, so it must be read as
+ * everything after the `llmsk-<id>-` prefix. Splitting on `-` and taking the
+ * last part — or the first part — silently returns a truncated fragment.
+ */
+export function keySecretFromPlaintext(plaintext: string): string {
+  return parsePlaintext(plaintext)?.secret ?? "";
+}
+
 /** In-memory fixed-window counters were replaced by a cross-process store. */
 export {
   checkDailyQuota,

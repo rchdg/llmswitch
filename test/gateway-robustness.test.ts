@@ -5,6 +5,7 @@ import { acquireFileLock, tryWithFileLock } from "../src/utils/file-lock.ts";
 import { splitQualified } from "../src/gateway/router.ts";
 import {
   createGatewayKey,
+  keySecretFromPlaintext,
   listGatewayKeys,
   publicKeyView,
   rotateGatewayKey,
@@ -84,22 +85,45 @@ describe("usage accounting", () => {
 
 describe("key hint", () => {
   // 之前 hint 同时暴露密钥的首 4 位和尾 4 位，与「仅存哈希」的说法不符。
+  //
+  // 这里改成断言 hint 的完整内容，而不是「不含首 4 位」这类子串检查：后者只
+  // 有在 secret 正确解析时才有意义，且理论上仍可能偶然命中。精确相等同时覆盖
+  // 「含尾 4 位」「不含首 4 位」「不含完整 secret」三条性质，且完全确定性。
   test("only exposes the last 4 characters of the secret", () => {
     const { key, plaintext } = createGatewayKey({ name: "t" });
-    const secret = plaintext.split("-").pop()!;
-    expect(key.hint).toContain(secret.slice(-4));
-    expect(key.hint).not.toContain(secret.slice(0, 4));
-    expect(key.hint).not.toContain(secret);
+    expect(key.hint).toBe(`llmsk-${key.id}-…${plaintext.slice(-4)}`);
     expect(publicKeyView(key).hint).toBe(key.hint);
   });
 
   test("rotate keeps the same rule", () => {
     const created = createGatewayKey({ name: "t" });
     const rotated = rotateGatewayKey(created.key.id);
-    const secret = rotated.plaintext.split("-").pop()!;
-    expect(rotated.key.hint).toContain(secret.slice(-4));
-    expect(rotated.key.hint).not.toContain(secret.slice(0, 4));
+    expect(rotated.key.hint).toBe(
+      `llmsk-${rotated.key.id}-…${rotated.plaintext.slice(-4)}`,
+    );
     expect(listGatewayKeys()).toHaveLength(1);
+  });
+});
+
+describe("plaintext key parsing", () => {
+  // 回归：secret 是 base64url，字母表含 `-`，按 `-` 切分取最后一段会截断。
+  // 截断后 secret 可能短到 slice(0,4) === slice(-4)，使断言自相矛盾。
+  test("keeps a secret containing '-' intact", () => {
+    expect(keySecretFromPlaintext("llmsk-abc123-Xy9-m4-4")).toBe("Xy9-m4-4");
+  });
+
+  test("recovers the full secret of a freshly issued key", () => {
+    const { key, plaintext } = createGatewayKey({ name: "t" });
+    const secret = keySecretFromPlaintext(plaintext);
+    expect(secret).toBe(plaintext.slice(`llmsk-${key.id}-`.length));
+    expect(secret.length).toBeGreaterThan(8);
+  });
+
+  test("returns an empty string for malformed input", () => {
+    expect(keySecretFromPlaintext("")).toBe("");
+    expect(keySecretFromPlaintext("not-a-key")).toBe("");
+    expect(keySecretFromPlaintext("llmsk-abc123")).toBe("");
+    expect(keySecretFromPlaintext("wrong-abc123-secret")).toBe("");
   });
 });
 

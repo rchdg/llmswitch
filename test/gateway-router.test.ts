@@ -22,6 +22,7 @@ import {
   deleteGatewayKey,
   hasAnyActiveKey,
   keyAllowsTarget,
+  keySecretFromPlaintext,
   keyStatus,
   listGatewayKeys,
   resetRateLimits,
@@ -267,7 +268,7 @@ describe("api keys", () => {
     expect(stored).toHaveLength(1);
     // The plaintext secret is never persisted.
     expect(JSON.stringify(stored)).not.toContain(
-      created.plaintext.split("-").slice(2).join("-"),
+      keySecretFromPlaintext(created.plaintext),
     );
     expect(stored[0]?.hash).not.toBe(created.plaintext);
   });
